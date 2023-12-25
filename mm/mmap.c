@@ -2213,10 +2213,25 @@ unsigned long vm_unmapped_area(struct vm_unmapped_area_info *info)
 	else
 		addr = unmapped_area(info);
 
+	if (IS_ERR_VALUE(addr)) {
+		pr_warn_ratelimited("%s err:%ld total_vm:0x%lx flags:0x%lx len:0x%lx low:0x%lx high:0x%lx mask:0x%lx offset:0x%lx\n",
+			__func__, addr, current->mm->total_vm, info->flags,
+			info->length, info->low_limit, info->high_limit,
+			info->align_mask, info->align_offset);
+	}
+
 	trace_vm_unmapped_area(addr, info);
 	return addr;
 }
 EXPORT_SYMBOL_GPL(vm_unmapped_area);
+
+#ifndef arch_get_mmap_end
+#define arch_get_mmap_end(addr)	(TASK_SIZE)
+#endif
+
+#ifndef arch_get_mmap_base
+#define arch_get_mmap_base(addr, base) (base)
+#endif
 
 /* Get an address range which is currently unmapped.
  * For shmat() with addr=0.
@@ -2673,7 +2688,7 @@ static int __init cmdline_parse_stack_guard_gap(char *p)
 	if (!*endptr)
 		stack_guard_gap = val << PAGE_SHIFT;
 
-	return 1;
+	return 0;
 }
 __setup("stack_guard_gap=", cmdline_parse_stack_guard_gap);
 
@@ -2765,28 +2780,11 @@ static void unmap_region(struct mm_struct *mm,
 {
 	struct vm_area_struct *next = vma_next(mm, prev);
 	struct mmu_gather tlb;
-	struct vm_area_struct *cur_vma;
 
 	lru_add_drain();
 	tlb_gather_mmu(&tlb, mm, start, end);
 	update_hiwater_rss(mm);
 	unmap_vmas(&tlb, vma, start, end);
-
-	/*
-	 * Ensure we have no stale TLB entries by the time this mapping is
-	 * removed from the rmap.
-	 * Note that we don't have to worry about nested flushes here because
-	 * we're holding the mm semaphore for removing the mapping - so any
-	 * concurrent flush in this region has to be coming through the rmap,
-	 * and we synchronize against that using the rmap lock.
-	 */
-	for (cur_vma = vma; cur_vma; cur_vma = cur_vma->vm_next) {
-		if ((cur_vma->vm_flags & (VM_PFNMAP|VM_MIXEDMAP)) != 0) {
-			tlb_flush_mmu(&tlb);
-			break;
-		}
-	}
-
 	free_pgtables(&tlb, vma, prev ? prev->vm_end : FIRST_USER_ADDRESS,
 				 next ? next->vm_start : USER_PGTABLES_CEILING);
 	tlb_finish_mmu(&tlb, start, end);
@@ -3306,9 +3304,10 @@ void exit_mmap(struct mm_struct *mm)
 		(void)__oom_reap_task_mm(mm);
 
 		set_bit(MMF_OOM_SKIP, &mm->flags);
+		mmap_write_lock(mm);
+		mmap_write_unlock(mm);
 	}
 
-	mmap_write_lock(mm);
 	if (mm->locked_vm) {
 		vma = mm->mmap;
 		while (vma) {
@@ -3321,11 +3320,8 @@ void exit_mmap(struct mm_struct *mm)
 	arch_exit_mmap(mm);
 
 	vma = mm->mmap;
-	if (!vma) {
-		/* Can happen if dup_mmap() received an OOM */
-		mmap_write_unlock(mm);
+	if (!vma)	/* Can happen if dup_mmap() received an OOM */
 		return;
-	}
 
 	lru_add_drain();
 	flush_cache_mm(mm);
@@ -3336,15 +3332,16 @@ void exit_mmap(struct mm_struct *mm)
 	free_pgtables(&tlb, vma, FIRST_USER_ADDRESS, USER_PGTABLES_CEILING);
 	tlb_finish_mmu(&tlb, 0, -1);
 
-	/* Walk the list again, actually closing and freeing it. */
+	/*
+	 * Walk the list again, actually closing and freeing it,
+	 * with preemption enabled, without holding any MM locks.
+	 */
 	while (vma) {
 		if (vma->vm_flags & VM_ACCOUNT)
 			nr_accounted += vma_pages(vma);
 		vma = remove_vma(vma);
 		cond_resched();
 	}
-	mm->mmap = NULL;
-	mmap_write_unlock(mm);
 	vm_unacct_memory(nr_accounted);
 }
 

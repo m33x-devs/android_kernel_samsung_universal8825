@@ -36,6 +36,10 @@
 #include "internal.h"
 #include <trace/hooks/syscall_check.h>
 
+#ifdef CONFIG_SECURITY_DEFEX
+#include <linux/defex.h>
+#endif
+
 int do_truncate(struct dentry *dentry, loff_t length, unsigned int time_attrs,
 	struct file *filp)
 {
@@ -1110,12 +1114,6 @@ inline int build_open_flags(const struct open_how *how, struct open_flags *op)
 		lookup_flags |= LOOKUP_BENEATH;
 	if (how->resolve & RESOLVE_IN_ROOT)
 		lookup_flags |= LOOKUP_IN_ROOT;
-	if (how->resolve & RESOLVE_CACHED) {
-		/* Don't bother even trying for create/truncate/tmpfile open */
-		if (flags & (O_TRUNC | O_CREAT | O_TMPFILE))
-			return -EAGAIN;
-		lookup_flags |= LOOKUP_CACHED;
-	}
 
 	op->lookup_flags = lookup_flags;
 	return 0;
@@ -1164,7 +1162,7 @@ struct file *filp_open(const char *filename, int flags, umode_t mode)
 	}
 	return file;
 }
-EXPORT_SYMBOL_NS(filp_open, ANDROID_GKI_VFS_EXPORT_ONLY);
+EXPORT_SYMBOL(filp_open);
 
 /* ANDROID: Allow drivers to open only block files from kernel mode */
 struct file *filp_open_block(const char *filename, int flags, umode_t mode)
@@ -1215,6 +1213,13 @@ static long do_sys_openat2(int dfd, const char __user *filename,
 	fd = get_unused_fd_flags(how->flags);
 	if (fd >= 0) {
 		struct file *f = do_filp_open(dfd, tmp, &op);
+
+#ifdef CONFIG_SECURITY_DEFEX
+		if (!IS_ERR(f) && task_defex_enforce(current, f, -__NR_openat)) {
+			fput(f);
+			f = ERR_PTR(-EPERM);
+		}
+#endif
 		if (IS_ERR(f)) {
 			put_unused_fd(fd);
 			fd = PTR_ERR(f);
@@ -1396,7 +1401,7 @@ int generic_file_open(struct inode * inode, struct file * filp)
 	return 0;
 }
 
-EXPORT_SYMBOL_NS(generic_file_open, ANDROID_GKI_VFS_EXPORT_ONLY);
+EXPORT_SYMBOL(generic_file_open);
 
 /*
  * This is used by subsystems that don't want seekable

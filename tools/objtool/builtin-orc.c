@@ -51,7 +51,11 @@ int cmd_orc(int argc, const char **argv)
 		if (list_empty(&file->insn_list))
 			return 0;
 
-		ret = orc_create(file);
+		ret = create_orc(file);
+		if (ret)
+			return ret;
+
+		ret = create_orc_sections(file);
 		if (ret)
 			return ret;
 

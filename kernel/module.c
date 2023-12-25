@@ -67,6 +67,11 @@
 #include <trace/hooks/module.h>
 #include <trace/hooks/memory.h>
 
+#ifdef CONFIG_RKP
+#include <linux/uh.h>
+#include <linux/rkp.h>
+#endif
+
 #ifndef ARCH_SHF_SMALL
 #define ARCH_SHF_SMALL 0
 #endif
@@ -987,6 +992,9 @@ SYSCALL_DEFINE2(delete_module, const char __user *, name_user,
 	struct module *mod;
 	char name[MODULE_NAME_LEN];
 	int ret, forced = 0;
+#ifdef CONFIG_RKP
+	struct module_info rkp_mod_info;
+#endif
 
 	if (!capable(CAP_SYS_MODULE) || modules_disabled)
 		return -EPERM;
@@ -1049,6 +1057,18 @@ SYSCALL_DEFINE2(delete_module, const char __user *, name_user,
 	/* Store the name of the last unloaded module for diagnostic purposes */
 	strlcpy(last_unloaded_module, mod->name, sizeof(last_unloaded_module));
 
+#ifdef CONFIG_RKP
+	rkp_mod_info.base_va = 0;
+	rkp_mod_info.vm_size = 0;
+	rkp_mod_info.core_base_va = (u64)mod->core_layout.base;
+	rkp_mod_info.core_text_size = (u64)mod->core_layout.text_size;
+	rkp_mod_info.core_ro_size = (u64)mod->core_layout.ro_size;
+	rkp_mod_info.init_base_va = 0;
+	rkp_mod_info.init_text_size = 0;
+	memcpy(&rkp_mod_info.module_name, mod->name, RKP_MODULE_NAME_LEN);
+
+	uh_call(UH_APP_RKP, RKP_MODULE_LOAD, RKP_MODULE_PXN_SET, (u64)&rkp_mod_info, 0, 0);
+#endif
 	free_module(mod);
 	/* someone could wait for the module in add_unformed_module() */
 	wake_up_all(&module_wq);
@@ -1272,6 +1292,15 @@ static ssize_t show_taint(struct module_attribute *mattr,
 static struct module_attribute modinfo_taint =
 	__ATTR(taint, 0444, show_taint, NULL);
 
+static ssize_t show_reboot_multicmd(struct module_attribute *mattr,
+                             struct module_kobject *mk, char *buffer)
+{
+        return sprintf(buffer, "%u\n", 1);
+}
+
+static struct module_attribute modinfo_reboot_multicmd =
+        __ATTR(reboot_multicmd, 0400, show_reboot_multicmd, NULL);
+
 static struct module_attribute *modinfo_attrs[] = {
 	&module_uevent,
 	&modinfo_version,
@@ -1281,6 +1310,7 @@ static struct module_attribute *modinfo_attrs[] = {
 	&modinfo_coresize,
 	&modinfo_initsize,
 	&modinfo_taint,
+	&modinfo_reboot_multicmd,
 #ifdef CONFIG_MODULE_UNLOAD
 	&modinfo_refcnt,
 #endif
@@ -2297,15 +2327,6 @@ void *__symbol_get(const char *symbol)
 }
 EXPORT_SYMBOL_GPL(__symbol_get);
 
-static bool module_init_layout_section(const char *sname)
-{
-#ifndef CONFIG_MODULE_UNLOAD
-	if (module_exit_section(sname))
-		return true;
-#endif
-	return module_init_section(sname);
-}
-
 /*
  * Ensure that an exported symbol [global namespace] does not already exist
  * in the kernel or in some other module's exported symbol table.
@@ -2515,7 +2536,7 @@ static void layout_sections(struct module *mod, struct load_info *info)
 			if ((s->sh_flags & masks[m][0]) != masks[m][0]
 			    || (s->sh_flags & masks[m][1])
 			    || s->sh_entsize != ~0UL
-			    || module_init_layout_section(sname))
+			    || module_init_section(sname))
 				continue;
 			s->sh_entsize = get_offset(mod, &mod->core_layout.size, s, i);
 			pr_debug("\t%s\n", sname);
@@ -2548,7 +2569,7 @@ static void layout_sections(struct module *mod, struct load_info *info)
 			if ((s->sh_flags & masks[m][0]) != masks[m][0]
 			    || (s->sh_flags & masks[m][1])
 			    || s->sh_entsize != ~0UL
-			    || !module_init_layout_section(sname))
+			    || !module_init_section(sname))
 				continue;
 			s->sh_entsize = (get_offset(mod, &mod->init_layout.size, s, i)
 					 | INIT_OFFSET_MASK);
@@ -3197,6 +3218,11 @@ static int rewrite_section_headers(struct load_info *info, int flags)
 		   temporary image. */
 		shdr->sh_addr = (size_t)info->hdr + shdr->sh_offset;
 
+#ifndef CONFIG_MODULE_UNLOAD
+		/* Don't load .exit sections */
+		if (module_exit_section(info->secstrings+shdr->sh_name))
+			shdr->sh_flags &= ~(unsigned long)SHF_ALLOC;
+#endif
 	}
 
 	/* Track but don't keep modinfo and version sections. */
@@ -3735,6 +3761,9 @@ static noinline int do_init_module(struct module *mod)
 {
 	int ret = 0;
 	struct mod_initfree *freeinit;
+#ifdef CONFIG_RKP
+	struct module_info rkp_mod_info;
+#endif
 
 	freeinit = kmalloc(sizeof(*freeinit), GFP_KERNEL);
 	if (!freeinit) {
@@ -3742,6 +3771,12 @@ static noinline int do_init_module(struct module *mod)
 		goto fail;
 	}
 	freeinit->module_init = mod->init_layout.base;
+
+	/*
+	 * We want to find out whether @mod uses async during init.  Clear
+	 * PF_USED_ASYNC.  async_schedule*() will set it.
+	 */
+	current->flags &= ~PF_USED_ASYNC;
 
 	do_mod_ctors(mod);
 	/* Start the module */
@@ -3768,13 +3803,22 @@ static noinline int do_init_module(struct module *mod)
 
 	/*
 	 * We need to finish all async code before the module init sequence
-	 * is done. This has potential to deadlock if synchronous module
-	 * loading is requested from async (which is not allowed!).
+	 * is done.  This has potential to deadlock.  For example, a newly
+	 * detected block device can trigger request_module() of the
+	 * default iosched from async probing task.  Once userland helper
+	 * reaches here, async_synchronize_full() will wait on the async
+	 * task waiting on request_module() and deadlock.
 	 *
-	 * See commit 0fdff3ec6d87 ("async, kmod: warn on synchronous
-	 * request_module() from async workers") for more details.
+	 * This deadlock is avoided by perfomring async_synchronize_full()
+	 * iff module init queued any async jobs.  This isn't a full
+	 * solution as it will deadlock the same if module loading from
+	 * async jobs nests more than once; however, due to the various
+	 * constraints, this hack seems to be the best option for now.
+	 * Please refer to the following thread for details.
+	 *
+	 * http://thread.gmane.org/gmane.linux.kernel/1420814
 	 */
-	if (!mod->async_probe_requested)
+	if (!mod->async_probe_requested && (current->flags & PF_USED_ASYNC))
 		async_synchronize_full();
 
 	ftrace_free_mem(mod, mod->init_layout.base, mod->init_layout.base +
@@ -3795,6 +3839,18 @@ static noinline int do_init_module(struct module *mod)
 		(mod->init_layout.size)>>PAGE_SHIFT);
 	trace_android_vh_set_memory_nx((unsigned long)mod->init_layout.base,
 		(mod->init_layout.size)>>PAGE_SHIFT);
+#ifdef CONFIG_RKP
+	rkp_mod_info.base_va = 0;
+	rkp_mod_info.vm_size = 0;
+	rkp_mod_info.core_base_va = 0;
+	rkp_mod_info.core_text_size = 0;
+	rkp_mod_info.core_ro_size = 0;
+	rkp_mod_info.init_base_va = (u64)mod->init_layout.base;
+	rkp_mod_info.init_text_size = (u64)mod->init_layout.text_size;
+	memcpy(&rkp_mod_info.module_name, mod->name, RKP_MODULE_NAME_LEN);
+
+	uh_call(UH_APP_RKP, RKP_MODULE_LOAD, RKP_MODULE_PXN_SET, (u64)&rkp_mod_info, 0, 0);
+#endif
 	mod->init_layout.base = NULL;
 	mod->init_layout.size = 0;
 	mod->init_layout.ro_size = 0;
@@ -3832,6 +3888,18 @@ fail:
 				     MODULE_STATE_GOING, mod);
 	klp_module_going(mod);
 	ftrace_release_mod(mod);
+#ifdef CONFIG_RKP
+	rkp_mod_info.base_va = 0;
+	rkp_mod_info.vm_size = 0;
+	rkp_mod_info.core_base_va = (u64)mod->core_layout.base;
+	rkp_mod_info.core_text_size = (u64)mod->core_layout.text_size;
+	rkp_mod_info.core_ro_size = (u64)mod->core_layout.ro_size;
+	rkp_mod_info.init_base_va = (u64)mod->init_layout.base;
+	rkp_mod_info.init_text_size = (u64)mod->init_layout.text_size;
+	memcpy(&rkp_mod_info.module_name, mod->name, RKP_MODULE_NAME_LEN);
+
+	uh_call(UH_APP_RKP, RKP_MODULE_LOAD, RKP_MODULE_PXN_SET, (u64)&rkp_mod_info, 0, 0);
+#endif
 	free_module(mod);
 	wake_up_all(&module_wq);
 	return ret;
@@ -3887,6 +3955,9 @@ out_unlocked:
 static int complete_formation(struct module *mod, struct load_info *info)
 {
 	int err;
+#ifdef CONFIG_RKP
+	struct module_info rkp_mod_info;
+#endif
 
 	mutex_lock(&module_mutex);
 
@@ -3906,6 +3977,18 @@ static int complete_formation(struct module *mod, struct load_info *info)
 	/* Mark state as coming so strong_try_module_get() ignores us,
 	 * but kallsyms etc. can see us. */
 	mod->state = MODULE_STATE_COMING;
+#ifdef CONFIG_RKP
+	rkp_mod_info.base_va = 0;
+	rkp_mod_info.vm_size = 0;
+	rkp_mod_info.core_base_va = (u64)mod->core_layout.base;
+	rkp_mod_info.core_text_size = (u64)mod->core_layout.text_size;
+	rkp_mod_info.core_ro_size = (u64)mod->core_layout.ro_size;
+	rkp_mod_info.init_base_va = (u64)mod->init_layout.base;
+	rkp_mod_info.init_text_size = (u64)mod->init_layout.text_size;
+	memcpy(&rkp_mod_info.module_name, mod->name, RKP_MODULE_NAME_LEN);
+	
+	uh_call(UH_APP_RKP, RKP_MODULE_LOAD, RKP_MODULE_PXN_CLEAR, (u64)&rkp_mod_info, 0, 0);
+#endif
 	mutex_unlock(&module_mutex);
 
 	return 0;
@@ -3961,6 +4044,9 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	struct module *mod;
 	long err = 0;
 	char *after_dashes;
+#ifdef CONFIG_RKP
+	struct module_info rkp_mod_info;
+#endif
 
 	/*
 	 * Do the signature check (if any) first. All that
@@ -4149,7 +4235,18 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	mutex_lock(&module_mutex);
 	module_bug_cleanup(mod);
 	mutex_unlock(&module_mutex);
+#ifdef CONFIG_RKP
+	rkp_mod_info.base_va = 0;
+	rkp_mod_info.vm_size = 0;
+	rkp_mod_info.core_base_va = (u64)mod->core_layout.base;
+	rkp_mod_info.core_text_size = (u64)mod->core_layout.text_size;
+	rkp_mod_info.core_ro_size = (u64)mod->core_layout.ro_size;
+	rkp_mod_info.init_base_va = (u64)mod->init_layout.base;
+	rkp_mod_info.init_text_size = (u64)mod->init_layout.text_size;
+	memcpy(&rkp_mod_info.module_name, mod->name, RKP_MODULE_NAME_LEN);
 
+	uh_call(UH_APP_RKP, RKP_MODULE_LOAD, RKP_MODULE_PXN_SET, (u64)&rkp_mod_info, 0, 0);
+#endif
  ddebug_cleanup:
 	ftrace_release_mod(mod);
 	dynamic_debug_remove(mod, info->debug);

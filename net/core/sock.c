@@ -136,12 +136,27 @@
 
 #include <trace/events/sock.h>
 #include <trace/hooks/sched.h>
+#include <trace/hooks/net.h>
 
 #include <net/tcp.h>
 #include <net/busy_poll.h>
 
+// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+#include <linux/pid.h>
+#define PROCESS_NAME_LEN_NAP	128 
+#define DOMAIN_NAME_LEN_NAP		255 
+#endif
+// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
+
 static DEFINE_MUTEX(proto_list_mutex);
 static LIST_HEAD(proto_list);
+
+// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA { 
+#ifdef CONFIG_KNOX_NCM 
+extern unsigned int check_ncm_flag(void); 
+#endif 
+// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA } 
 
 static void sock_inuse_add(struct net *net, int val);
 
@@ -685,6 +700,105 @@ out:
 	return ret;
 }
 
+// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+/** The function sets the domain name associated with the socket. **/
+static int sock_set_domain_name(struct sock *sk, sockptr_t optval,
+				int optlen)
+{
+	int ret = -EADDRNOTAVAIL;
+	char domain[DOMAIN_NAME_LEN_NAP];
+
+	ret = -EINVAL;
+	if (optlen < 0)
+		goto out;
+
+	if (optlen > DOMAIN_NAME_LEN_NAP - 1)
+		optlen = DOMAIN_NAME_LEN_NAP - 1;
+
+	memset(domain, 0, sizeof(domain));
+
+	ret = -EFAULT;
+	if (copy_from_sockptr(domain, optval, optlen))
+		goto out;
+
+	if (SOCK_NPA_VENDOR_DATA_GET(sk)) {
+		memcpy(SOCK_NPA_VENDOR_DATA_GET(sk)->domain_name, domain, sizeof(SOCK_NPA_VENDOR_DATA_GET(sk)->domain_name)-1);
+		ret = 0;
+	}
+
+out:
+	return ret;
+}
+
+/** The function sets the uid associated with the dns socket. **/
+static int sock_set_dns_uid(struct sock *sk, sockptr_t optval, int optlen)
+{
+	int ret = -EADDRNOTAVAIL;
+
+	if (optlen < 0)
+		goto out;
+
+	if (optlen == sizeof(uid_t)) {
+		uid_t dns_uid;
+		ret = -EFAULT;
+		if (copy_from_sockptr(&dns_uid, optval, sizeof(dns_uid)))
+			goto out;
+
+		if (SOCK_NPA_VENDOR_DATA_GET(sk)) {
+			memcpy(&SOCK_NPA_VENDOR_DATA_GET(sk)->knox_dns_uid, &dns_uid, sizeof(SOCK_NPA_VENDOR_DATA_GET(sk)->knox_dns_uid));
+			ret = 0;
+		}
+	}
+
+out:
+	return ret;
+}
+
+/** The function sets the pid and the process name associated with the dns socket. **/
+static int sock_set_dns_pid(struct sock *sk, sockptr_t optval, int optlen)
+{
+	int ret = -EADDRNOTAVAIL;
+	struct pid *pid_struct = NULL;
+	struct task_struct *task = NULL;
+	int process_returnValue = -1;
+	char full_process_name[PROCESS_NAME_LEN_NAP] = {0};
+
+	if (optlen < 0)
+		goto out;
+
+	if (optlen == sizeof(pid_t)) {
+		pid_t dns_pid;
+		ret = -EFAULT;
+		if (copy_from_sockptr(&dns_pid, optval, sizeof(dns_pid)))
+			goto out;
+		
+		if (SOCK_NPA_VENDOR_DATA_GET(sk)) {
+			memcpy(&SOCK_NPA_VENDOR_DATA_GET(sk)->knox_dns_pid, &dns_pid, sizeof(SOCK_NPA_VENDOR_DATA_GET(sk)->knox_dns_pid));
+			if(check_ncm_flag()) {
+				pid_struct = find_get_pid(dns_pid);
+				if (pid_struct != NULL) {
+					task = pid_task(pid_struct,PIDTYPE_PID);
+					if (task != NULL) {
+						process_returnValue = get_cmdline(task, full_process_name, sizeof(full_process_name)-1);
+						if (process_returnValue > 0) {
+							memcpy(SOCK_NPA_VENDOR_DATA_GET(sk)->dns_process_name, full_process_name, sizeof(SOCK_NPA_VENDOR_DATA_GET(sk)->dns_process_name)-1);
+						} else {
+							memcpy(SOCK_NPA_VENDOR_DATA_GET(sk)->dns_process_name, task->comm, sizeof(task->comm)-1);
+						}
+					}
+				}
+			}
+			ret = 0;
+		}
+	}
+
+out:
+	return ret;
+}
+#endif
+// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
+
 bool sk_mc_loop(struct sock *sk)
 {
 	if (dev_recursion_level())
@@ -845,6 +959,16 @@ int sock_setsockopt(struct socket *sock, int level, int optname,
 
 	if (optname == SO_BINDTODEVICE)
 		return sock_setbindtodevice(sk, optval, optlen);
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+	if (optname == SO_SET_DOMAIN_NAME)
+		return sock_set_domain_name(sk, optval, optlen);
+	if (optname == SO_SET_DNS_UID)
+		return sock_set_dns_uid(sk, optval, optlen);
+	if (optname == SO_SET_DNS_PID)
+		return sock_set_dns_pid(sk, optval, optlen);
+#endif
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
 
 	if (optlen < sizeof(int))
 		return -EINVAL;
@@ -1256,16 +1380,6 @@ set_sndbuf:
 }
 EXPORT_SYMBOL(sock_setsockopt);
 
-static const struct cred *sk_get_peer_cred(struct sock *sk)
-{
-	const struct cred *cred;
-
-	spin_lock(&sk->sk_peer_lock);
-	cred = get_cred(sk->sk_peer_cred);
-	spin_unlock(&sk->sk_peer_lock);
-
-	return cred;
-}
 
 static void cred_to_ucred(struct pid *pid, const struct cred *cred,
 			  struct ucred *ucred)
@@ -1439,11 +1553,7 @@ int sock_getsockopt(struct socket *sock, int level, int optname,
 		struct ucred peercred;
 		if (len > sizeof(peercred))
 			len = sizeof(peercred);
-
-		spin_lock(&sk->sk_peer_lock);
 		cred_to_ucred(sk->sk_peer_pid, sk->sk_peer_cred, &peercred);
-		spin_unlock(&sk->sk_peer_lock);
-
 		if (copy_to_user(optval, &peercred, len))
 			return -EFAULT;
 		goto lenout;
@@ -1451,23 +1561,20 @@ int sock_getsockopt(struct socket *sock, int level, int optname,
 
 	case SO_PEERGROUPS:
 	{
-		const struct cred *cred;
 		int ret, n;
 
-		cred = sk_get_peer_cred(sk);
-		if (!cred)
+		if (!sk->sk_peer_cred)
 			return -ENODATA;
 
-		n = cred->group_info->ngroups;
+		n = sk->sk_peer_cred->group_info->ngroups;
 		if (len < n * sizeof(gid_t)) {
 			len = n * sizeof(gid_t);
-			put_cred(cred);
 			return put_user(len, optlen) ? -EFAULT : -ERANGE;
 		}
 		len = n * sizeof(gid_t);
 
-		ret = groups_to_user((gid_t __user *)optval, cred->group_info);
-		put_cred(cred);
+		ret = groups_to_user((gid_t __user *)optval,
+				     sk->sk_peer_cred->group_info);
 		if (ret)
 			return ret;
 		goto lenout;
@@ -1664,6 +1771,11 @@ static void sock_copy(struct sock *nsk, const struct sock *osk)
 #ifdef CONFIG_SECURITY_NETWORK
 	void *sptr = nsk->sk_security;
 #endif
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+	u64 android_vendor_data_npa = nsk->android_oem_data1;
+#endif
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
 	memcpy(nsk, osk, offsetof(struct sock, sk_dontcopy_begin));
 
 	memcpy(&nsk->sk_dontcopy_end, &osk->sk_dontcopy_end,
@@ -1673,6 +1785,11 @@ static void sock_copy(struct sock *nsk, const struct sock *osk)
 	nsk->sk_security = sptr;
 	security_sk_clone(osk, nsk);
 #endif
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+	nsk->android_oem_data1 = android_vendor_data_npa;
+#endif
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
 }
 
 static struct sock *sk_prot_alloc(struct proto *prot, gfp_t priority,
@@ -1692,8 +1809,20 @@ static struct sock *sk_prot_alloc(struct proto *prot, gfp_t priority,
 		sk = kmalloc(prot->obj_size, priority);
 
 	if (sk != NULL) {
+		// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+		sk->android_oem_data1 = (u64)NULL;
+#endif
+		// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
 		if (security_sk_alloc(sk, family, priority))
 			goto out_free;
+
+		trace_android_rvh_sk_alloc(sk);
+		// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+		sk->android_oem_data1 = (u64)kzalloc(sizeof(struct sock_npa_vendor_data), GFP_NOWAIT);
+#endif
+		// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
 
 		if (!try_module_get(prot->owner))
 			goto out_free_sec;
@@ -1704,6 +1833,15 @@ static struct sock *sk_prot_alloc(struct proto *prot, gfp_t priority,
 
 out_free_sec:
 	security_sk_free(sk);
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+	if (SOCK_NPA_VENDOR_DATA_GET(sk)) {
+		kfree(SOCK_NPA_VENDOR_DATA_GET(sk));
+		sk->android_oem_data1 = (u64)NULL;
+	}
+#endif
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
+	trace_android_rvh_sk_free(sk);
 out_free:
 	if (slab != NULL)
 		kmem_cache_free(slab, sk);
@@ -1723,6 +1861,15 @@ static void sk_prot_free(struct proto *prot, struct sock *sk)
 	cgroup_sk_free(&sk->sk_cgrp_data);
 	mem_cgroup_sk_free(sk);
 	security_sk_free(sk);
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+	if (SOCK_NPA_VENDOR_DATA_GET(sk)) {
+		kfree(SOCK_NPA_VENDOR_DATA_GET(sk));
+		sk->android_oem_data1 = (u64)NULL;
+	}
+#endif
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
+	trace_android_rvh_sk_free(sk);
 	if (slab != NULL)
 		kmem_cache_free(slab, sk);
 	else
@@ -1742,10 +1889,60 @@ struct sock *sk_alloc(struct net *net, int family, gfp_t priority,
 		      struct proto *prot, int kern)
 {
 	struct sock *sk;
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+	struct pid *pid_struct = NULL;
+	struct task_struct *task = NULL;
+	int process_returnValue = -1;
+	char full_process_name[PROCESS_NAME_LEN_NAP] = {0};
+	struct pid *parent_pid_struct = NULL;
+	struct task_struct *parent_task = NULL;
+	int parent_returnValue = -1;
+	char full_parent_process_name[PROCESS_NAME_LEN_NAP] = {0};
+#endif
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
 
 	sk = sk_prot_alloc(prot, priority | __GFP_ZERO, family);
 	if (sk) {
 		sk->sk_family = family;
+		// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+		if (SOCK_NPA_VENDOR_DATA_GET(sk)) {
+			SOCK_NPA_VENDOR_DATA_GET(sk)->knox_uid = current->cred->uid.val;
+			SOCK_NPA_VENDOR_DATA_GET(sk)->knox_pid = current->tgid;
+			if (check_ncm_flag()) {
+				pid_struct = find_get_pid(current->tgid);
+				if (pid_struct != NULL) {
+					task = pid_task(pid_struct, PIDTYPE_PID);
+					if (task != NULL) {
+						process_returnValue = get_cmdline(task, full_process_name, sizeof(full_process_name)-1);
+						if (process_returnValue > 0) {
+							memcpy(SOCK_NPA_VENDOR_DATA_GET(sk)->process_name, full_process_name, sizeof(SOCK_NPA_VENDOR_DATA_GET(sk)->process_name)-1);
+						} else {
+							memcpy(SOCK_NPA_VENDOR_DATA_GET(sk)->process_name, task->comm, sizeof(task->comm)-1);
+						}
+						if (task->parent != NULL) {
+							parent_pid_struct = find_get_pid(task->parent->tgid);
+							if (parent_pid_struct != NULL) {
+								parent_task = pid_task(parent_pid_struct, PIDTYPE_PID);
+								if (parent_task != NULL) {
+									parent_returnValue = get_cmdline(parent_task, full_parent_process_name, sizeof(full_parent_process_name)-1);
+									if (parent_returnValue > 0) {
+										memcpy(SOCK_NPA_VENDOR_DATA_GET(sk)->parent_process_name, full_parent_process_name, sizeof(SOCK_NPA_VENDOR_DATA_GET(sk)->parent_process_name)-1);
+									} else {
+										memcpy(SOCK_NPA_VENDOR_DATA_GET(sk)->parent_process_name, parent_task->comm, sizeof(parent_task->comm)-1);
+									}
+									SOCK_NPA_VENDOR_DATA_GET(sk)->knox_puid = parent_task->cred->uid.val;
+									SOCK_NPA_VENDOR_DATA_GET(sk)->knox_ppid = parent_task->tgid;
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+#endif
+		// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
 		/*
 		 * See comment in struct sock definition to understand
 		 * why we need sk_prot_creator -acme
@@ -1806,10 +2003,9 @@ static void __sk_destruct(struct rcu_head *head)
 		sk->sk_frag.page = NULL;
 	}
 
-	/* We do not need to acquire sk->sk_peer_lock, we are the last user. */
-	put_cred(sk->sk_peer_cred);
+	if (sk->sk_peer_cred)
+		put_cred(sk->sk_peer_cred);
 	put_pid(sk->sk_peer_pid);
-
 	if (likely(sk->sk_net_refcnt))
 		put_net(sock_net(sk));
 	sk_prot_free(sk->sk_prot_creator, sk);
@@ -1884,120 +2080,123 @@ static void sk_init_common(struct sock *sk)
 struct sock *sk_clone_lock(const struct sock *sk, const gfp_t priority)
 {
 	struct proto *prot = READ_ONCE(sk->sk_prot);
-	struct sk_filter *filter;
-	bool is_charged = true;
 	struct sock *newsk;
+	bool is_charged = true;
 
 	newsk = sk_prot_alloc(prot, priority, sk->sk_family);
-	if (!newsk)
-		goto out;
+	if (newsk != NULL) {
+		struct sk_filter *filter;
 
-	sock_copy(newsk, sk);
+		sock_copy(newsk, sk);
 
-	newsk->sk_prot_creator = prot;
+		newsk->sk_prot_creator = prot;
 
-	/* SANITY */
-	if (likely(newsk->sk_net_refcnt)) {
-		get_net(sock_net(newsk));
-		sock_inuse_add(sock_net(newsk), 1);
-	}
-	sk_node_init(&newsk->sk_node);
-	sock_lock_init(newsk);
-	bh_lock_sock(newsk);
-	newsk->sk_backlog.head	= newsk->sk_backlog.tail = NULL;
-	newsk->sk_backlog.len = 0;
+		/* SANITY */
+		if (likely(newsk->sk_net_refcnt))
+			get_net(sock_net(newsk));
+		sk_node_init(&newsk->sk_node);
+		sock_lock_init(newsk);
+		bh_lock_sock(newsk);
+		newsk->sk_backlog.head	= newsk->sk_backlog.tail = NULL;
+		newsk->sk_backlog.len = 0;
 
-	atomic_set(&newsk->sk_rmem_alloc, 0);
-
-	/* sk_wmem_alloc set to one (see sk_free() and sock_wfree()) */
-	refcount_set(&newsk->sk_wmem_alloc, 1);
-
-	atomic_set(&newsk->sk_omem_alloc, 0);
-	sk_init_common(newsk);
-
-	newsk->sk_dst_cache	= NULL;
-	newsk->sk_dst_pending_confirm = 0;
-	newsk->sk_wmem_queued	= 0;
-	newsk->sk_forward_alloc = 0;
-	atomic_set(&newsk->sk_drops, 0);
-	newsk->sk_send_head	= NULL;
-	newsk->sk_userlocks	= sk->sk_userlocks & ~SOCK_BINDPORT_LOCK;
-	atomic_set(&newsk->sk_zckey, 0);
-
-	sock_reset_flag(newsk, SOCK_DONE);
-
-	/* sk->sk_memcg will be populated at accept() time */
-	newsk->sk_memcg = NULL;
-
-	cgroup_sk_clone(&newsk->sk_cgrp_data);
-
-	rcu_read_lock();
-	filter = rcu_dereference(sk->sk_filter);
-	if (filter != NULL)
-		/* though it's an empty new sock, the charging may fail
-		 * if sysctl_optmem_max was changed between creation of
-		 * original socket and cloning
+		atomic_set(&newsk->sk_rmem_alloc, 0);
+		/*
+		 * sk_wmem_alloc set to one (see sk_free() and sock_wfree())
 		 */
-		is_charged = sk_filter_charge(newsk, filter);
-	RCU_INIT_POINTER(newsk->sk_filter, filter);
-	rcu_read_unlock();
+		refcount_set(&newsk->sk_wmem_alloc, 1);
+		atomic_set(&newsk->sk_omem_alloc, 0);
+		sk_init_common(newsk);
 
-	if (unlikely(!is_charged || xfrm_sk_clone_policy(newsk, sk))) {
-		/* We need to make sure that we don't uncharge the new
-		 * socket if we couldn't charge it in the first place
-		 * as otherwise we uncharge the parent's filter.
+		newsk->sk_dst_cache	= NULL;
+		newsk->sk_dst_pending_confirm = 0;
+		newsk->sk_wmem_queued	= 0;
+		newsk->sk_forward_alloc = 0;
+		atomic_set(&newsk->sk_drops, 0);
+		newsk->sk_send_head	= NULL;
+		newsk->sk_userlocks	= sk->sk_userlocks & ~SOCK_BINDPORT_LOCK;
+		atomic_set(&newsk->sk_zckey, 0);
+
+		sock_reset_flag(newsk, SOCK_DONE);
+
+		/* sk->sk_memcg will be populated at accept() time */
+		newsk->sk_memcg = NULL;
+
+		cgroup_sk_clone(&newsk->sk_cgrp_data);
+
+		rcu_read_lock();
+		filter = rcu_dereference(sk->sk_filter);
+		if (filter != NULL)
+			/* though it's an empty new sock, the charging may fail
+			 * if sysctl_optmem_max was changed between creation of
+			 * original socket and cloning
+			 */
+			is_charged = sk_filter_charge(newsk, filter);
+		RCU_INIT_POINTER(newsk->sk_filter, filter);
+		rcu_read_unlock();
+
+		if (unlikely(!is_charged || xfrm_sk_clone_policy(newsk, sk))) {
+			/* We need to make sure that we don't uncharge the new
+			 * socket if we couldn't charge it in the first place
+			 * as otherwise we uncharge the parent's filter.
+			 */
+			if (!is_charged)
+				RCU_INIT_POINTER(newsk->sk_filter, NULL);
+			sk_free_unlock_clone(newsk);
+			newsk = NULL;
+			goto out;
+		}
+		RCU_INIT_POINTER(newsk->sk_reuseport_cb, NULL);
+
+		if (bpf_sk_storage_clone(sk, newsk)) {
+			sk_free_unlock_clone(newsk);
+			newsk = NULL;
+			goto out;
+		}
+
+		/* Clear sk_user_data if parent had the pointer tagged
+		 * as not suitable for copying when cloning.
 		 */
-		if (!is_charged)
-			RCU_INIT_POINTER(newsk->sk_filter, NULL);
-		sk_free_unlock_clone(newsk);
-		newsk = NULL;
-		goto out;
+		if (sk_user_data_is_nocopy(newsk))
+			newsk->sk_user_data = NULL;
+
+		newsk->sk_err	   = 0;
+		newsk->sk_err_soft = 0;
+		newsk->sk_priority = 0;
+		newsk->sk_incoming_cpu = raw_smp_processor_id();
+		if (likely(newsk->sk_net_refcnt))
+			sock_inuse_add(sock_net(newsk), 1);
+
+		/*
+		 * Before updating sk_refcnt, we must commit prior changes to memory
+		 * (Documentation/RCU/rculist_nulls.rst for details)
+		 */
+		smp_wmb();
+		refcount_set(&newsk->sk_refcnt, 2);
+
+		/*
+		 * Increment the counter in the same struct proto as the master
+		 * sock (sk_refcnt_debug_inc uses newsk->sk_prot->socks, that
+		 * is the same as sk->sk_prot->socks, as this field was copied
+		 * with memcpy).
+		 *
+		 * This _changes_ the previous behaviour, where
+		 * tcp_create_openreq_child always was incrementing the
+		 * equivalent to tcp_prot->socks (inet_sock_nr), so this have
+		 * to be taken into account in all callers. -acme
+		 */
+		sk_refcnt_debug_inc(newsk);
+		sk_set_socket(newsk, NULL);
+		sk_tx_queue_clear(newsk);
+		RCU_INIT_POINTER(newsk->sk_wq, NULL);
+
+		if (newsk->sk_prot->sockets_allocated)
+			sk_sockets_allocated_inc(newsk);
+
+		if (sock_needs_netstamp(sk) &&
+		    newsk->sk_flags & SK_FLAGS_TIMESTAMP)
+			net_enable_timestamp();
 	}
-	RCU_INIT_POINTER(newsk->sk_reuseport_cb, NULL);
-
-	if (bpf_sk_storage_clone(sk, newsk)) {
-		sk_free_unlock_clone(newsk);
-		newsk = NULL;
-		goto out;
-	}
-
-	/* Clear sk_user_data if parent had the pointer tagged
-	 * as not suitable for copying when cloning.
-	 */
-	if (sk_user_data_is_nocopy(newsk))
-		newsk->sk_user_data = NULL;
-
-	newsk->sk_err	   = 0;
-	newsk->sk_err_soft = 0;
-	newsk->sk_priority = 0;
-	newsk->sk_incoming_cpu = raw_smp_processor_id();
-
-	/* Before updating sk_refcnt, we must commit prior changes to memory
-	 * (Documentation/RCU/rculist_nulls.rst for details)
-	 */
-	smp_wmb();
-	refcount_set(&newsk->sk_refcnt, 2);
-
-	/* Increment the counter in the same struct proto as the master
-	 * sock (sk_refcnt_debug_inc uses newsk->sk_prot->socks, that
-	 * is the same as sk->sk_prot->socks, as this field was copied
-	 * with memcpy).
-	 *
-	 * This _changes_ the previous behaviour, where
-	 * tcp_create_openreq_child always was incrementing the
-	 * equivalent to tcp_prot->socks (inet_sock_nr), so this have
-	 * to be taken into account in all callers. -acme
-	 */
-	sk_refcnt_debug_inc(newsk);
-	sk_set_socket(newsk, NULL);
-	sk_tx_queue_clear(newsk);
-	RCU_INIT_POINTER(newsk->sk_wq, NULL);
-
-	if (newsk->sk_prot->sockets_allocated)
-		sk_sockets_allocated_inc(newsk);
-
-	if (sock_needs_netstamp(sk) && newsk->sk_flags & SK_FLAGS_TIMESTAMP)
-		net_enable_timestamp();
 out:
 	return newsk;
 }
@@ -3026,8 +3225,6 @@ void sock_init_data(struct socket *sock, struct sock *sk)
 
 	sk->sk_peer_pid 	=	NULL;
 	sk->sk_peer_cred	=	NULL;
-	spin_lock_init(&sk->sk_peer_lock);
-
 	sk->sk_write_pending	=	0;
 	sk->sk_rcvlowat		=	1;
 	sk->sk_rcvtimeo		=	MAX_SCHEDULE_TIMEOUT;

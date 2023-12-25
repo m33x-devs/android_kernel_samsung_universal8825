@@ -154,6 +154,7 @@ static int hfi1_create_kctxt(struct hfi1_devdata *dd,
 	rcd->fast_handler = get_dma_rtail_setting(rcd) ?
 				handle_receive_interrupt_dma_rtail :
 				handle_receive_interrupt_nodma_rtail;
+	rcd->slow_handler = handle_receive_interrupt;
 
 	hfi1_set_seq_cnt(rcd, 1);
 
@@ -374,8 +375,6 @@ int hfi1_create_ctxtdata(struct hfi1_pportdata *ppd, int numa,
 		rcd->numa_id = numa;
 		rcd->rcv_array_groups = dd->rcv_entries.ngroups;
 		rcd->rhf_rcv_function_map = normal_rhf_rcv_functions;
-		rcd->slow_handler = handle_receive_interrupt;
-		rcd->do_interrupt = rcd->slow_handler;
 		rcd->msix_intr = CCE_NUM_MSIX_VECTORS;
 
 		mutex_init(&rcd->exp_mutex);
@@ -530,7 +529,7 @@ void set_link_ipg(struct hfi1_pportdata *ppd)
 	u16 shift, mult;
 	u64 src;
 	u32 current_egress_rate; /* Mbits /sec */
-	u64 max_pkt_time;
+	u32 max_pkt_time;
 	/*
 	 * max_pkt_time is the maximum packet egress time in units
 	 * of the fabric clock period 1/(805 MHz).
@@ -651,7 +650,12 @@ void hfi1_init_pportdata(struct pci_dev *pdev, struct hfi1_pportdata *ppd,
 
 	ppd->pkeys[default_pkey_idx] = DEFAULT_P_KEY;
 	ppd->part_enforce |= HFI1_PART_ENFORCE_IN;
-	ppd->pkeys[0] = 0x8001;
+
+	if (loopback) {
+		dd_dev_err(dd, "Faking data partition 0x8001 in idx %u\n",
+			   !default_pkey_idx);
+		ppd->pkeys[!default_pkey_idx] = 0x8001;
+	}
 
 	INIT_WORK(&ppd->link_vc_work, handle_verify_cap);
 	INIT_WORK(&ppd->link_up_work, handle_link_up);
@@ -916,6 +920,18 @@ int hfi1_init(struct hfi1_devdata *dd, int reinit)
 	if (ret)
 		goto done;
 
+	/* allocate dummy tail memory for all receive contexts */
+	dd->rcvhdrtail_dummy_kvaddr = dma_alloc_coherent(&dd->pcidev->dev,
+							 sizeof(u64),
+							 &dd->rcvhdrtail_dummy_dma,
+							 GFP_KERNEL);
+
+	if (!dd->rcvhdrtail_dummy_kvaddr) {
+		dd_dev_err(dd, "cannot allocate dummy tail memory\n");
+		ret = -ENOMEM;
+		goto done;
+	}
+
 	/* dd->rcd can be NULL if early initialization failed */
 	for (i = 0; dd->rcd && i < dd->first_dyn_alloc_ctxt; ++i) {
 		/*
@@ -927,6 +943,8 @@ int hfi1_init(struct hfi1_devdata *dd, int reinit)
 		rcd = hfi1_rcd_get_by_index(dd, i);
 		if (!rcd)
 			continue;
+
+		rcd->do_interrupt = &handle_receive_interrupt;
 
 		lastfail = hfi1_create_rcvhdrq(dd, rcd);
 		if (!lastfail)
@@ -1148,7 +1166,7 @@ void hfi1_free_ctxtdata(struct hfi1_devdata *dd, struct hfi1_ctxtdata *rcd)
 	rcd->egrbufs.rcvtids = NULL;
 
 	for (e = 0; e < rcd->egrbufs.alloced; e++) {
-		if (rcd->egrbufs.buffers[e].addr)
+		if (rcd->egrbufs.buffers[e].dma)
 			dma_free_coherent(&dd->pcidev->dev,
 					  rcd->egrbufs.buffers[e].len,
 					  rcd->egrbufs.buffers[e].addr,
@@ -1229,11 +1247,6 @@ void hfi1_free_devdata(struct hfi1_devdata *dd)
 	dd->tx_opstats    = NULL;
 	kfree(dd->comp_vect);
 	dd->comp_vect = NULL;
-	if (dd->rcvhdrtail_dummy_kvaddr)
-		dma_free_coherent(&dd->pcidev->dev, sizeof(u64),
-				  (void *)dd->rcvhdrtail_dummy_kvaddr,
-				  dd->rcvhdrtail_dummy_dma);
-	dd->rcvhdrtail_dummy_kvaddr = NULL;
 	sdma_clean(dd, dd->num_sdma);
 	rvt_dealloc_device(&dd->verbs_dev.rdi);
 }
@@ -1327,15 +1340,6 @@ static struct hfi1_devdata *hfi1_alloc_devdata(struct pci_dev *pdev,
 
 	dd->comp_vect = kzalloc(sizeof(*dd->comp_vect), GFP_KERNEL);
 	if (!dd->comp_vect) {
-		ret = -ENOMEM;
-		goto bail;
-	}
-
-	/* allocate dummy tail memory for all receive contexts */
-	dd->rcvhdrtail_dummy_kvaddr =
-		dma_alloc_coherent(&dd->pcidev->dev, sizeof(u64),
-				   &dd->rcvhdrtail_dummy_dma, GFP_KERNEL);
-	if (!dd->rcvhdrtail_dummy_kvaddr) {
 		ret = -ENOMEM;
 		goto bail;
 	}
@@ -1546,6 +1550,13 @@ static void cleanup_device_data(struct hfi1_devdata *dd)
 	}
 
 	free_credit_return(dd);
+
+	if (dd->rcvhdrtail_dummy_kvaddr) {
+		dma_free_coherent(&dd->pcidev->dev, sizeof(u64),
+				  (void *)dd->rcvhdrtail_dummy_kvaddr,
+				  dd->rcvhdrtail_dummy_dma);
+		dd->rcvhdrtail_dummy_kvaddr = NULL;
+	}
 
 	/*
 	 * Free any resources still in use (usually just kernel contexts)

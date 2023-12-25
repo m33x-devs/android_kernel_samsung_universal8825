@@ -28,6 +28,7 @@
 #include <linux/sched/signal.h>
 #include <linux/sched/mm.h>
 #include <linux/sysfs.h>
+#include <linux/sec_debug.h>
 
 #include "base.h"
 #include "power/power.h"
@@ -470,8 +471,8 @@ static void device_link_release_fn(struct work_struct *work)
 	/* Ensure that all references to the link object have been dropped. */
 	device_link_synchronize_removal();
 
-	pm_runtime_release_supplier(link);
-	pm_request_idle(link->supplier);
+	while (refcount_dec_not_one(&link->rpm_active))
+		pm_runtime_put(link->supplier);
 
 	put_device(link->consumer);
 	put_device(link->supplier);
@@ -672,8 +673,7 @@ struct device_link *device_link_add(struct device *consumer,
 {
 	struct device_link *link;
 
-	if (!consumer || !supplier || consumer == supplier ||
-	    flags & ~DL_ADD_VALID_FLAGS ||
+	if (!consumer || !supplier || flags & ~DL_ADD_VALID_FLAGS ||
 	    (flags & DL_FLAG_STATELESS && flags & DL_MANAGED_LINK_FLAGS) ||
 	    (flags & DL_FLAG_SYNC_STATE_ONLY &&
 	     (flags & ~DL_FLAG_INFERRED) != DL_FLAG_SYNC_STATE_ONLY) ||
@@ -806,7 +806,9 @@ struct device_link *device_link_add(struct device *consumer,
 		     dev_bus_name(supplier), dev_name(supplier),
 		     dev_bus_name(consumer), dev_name(consumer));
 	if (device_register(&link->link_dev)) {
-		put_device(&link->link_dev);
+		put_device(consumer);
+		put_device(supplier);
+		kfree(link);
 		link = NULL;
 		goto out;
 	}
@@ -1689,21 +1691,14 @@ static int fw_devlink_create_devlink(struct device *con,
 	 * be broken by applying logic. Check for these types of cycles and
 	 * break them so that devices in the cycle probe properly.
 	 *
-	 * If the supplier's parent is dependent on the consumer, then the
-	 * consumer and supplier have a cyclic dependency. Since fw_devlink
-	 * can't tell which of the inferred dependencies are incorrect, don't
-	 * enforce probe ordering between any of the devices in this cyclic
-	 * dependency. Do this by relaxing all the fw_devlink device links in
-	 * this cycle and by treating the fwnode link between the consumer and
-	 * the supplier as an invalid dependency.
+	 * If the supplier's parent is dependent on the consumer, then
+	 * the consumer-supplier dependency is a false dependency. So,
+	 * treat it as an invalid link.
 	 */
 	sup_dev = fwnode_get_next_parent_dev(sup_handle);
 	if (sup_dev && device_is_dependent(con, sup_dev)) {
-		dev_info(con, "Fixing up cyclic dependency with %pfwP (%s)\n",
-			 sup_handle, dev_name(sup_dev));
-		device_links_write_lock();
-		fw_devlink_relax_cycle(con, sup_dev);
-		device_links_write_unlock();
+		dev_dbg(con, "Not linking to %pfwP - False link\n",
+			sup_handle);
 		ret = -EINVAL;
 	} else {
 		/*
@@ -4331,6 +4326,7 @@ void device_shutdown(void)
 		dev = list_entry(devices_kset->list.prev, struct device,
 				kobj.entry);
 
+		secdbg_base_built_set_shutdown_device(__func__, dev_name(dev));
 		/*
 		 * hold reference count of device's parent to
 		 * prevent it from being freed because parent's
@@ -4378,6 +4374,7 @@ void device_shutdown(void)
 
 		spin_lock(&devices_kset->list_lock);
 	}
+	secdbg_base_built_set_shutdown_device(NULL, NULL);
 	spin_unlock(&devices_kset->list_lock);
 }
 

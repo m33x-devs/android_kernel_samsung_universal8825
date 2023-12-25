@@ -169,6 +169,13 @@ struct memcg_padding {
 #define MEMCG_PADDING(name)
 #endif
 
+#ifdef CONFIG_MEMCG_HEIMDALL
+#define MEMCG_HEIMDALL_SHRINK_ANON 1
+#define MEMCG_HEIMDALL_SHRINK_FILE 2
+void forced_shrink_node_memcg(struct pglist_data *pgdat, struct mem_cgroup *memcg,
+			      int type, unsigned long nr_requested);
+#endif
+
 /*
  * Remember four most recent foreign writebacks with dirty pages in this
  * cgroup.  Inode sharing is expected to be uncommon and, even if we miss
@@ -197,7 +204,7 @@ struct obj_cgroup {
 	struct mem_cgroup *memcg;
 	atomic_t nr_charged_bytes;
 	union {
-		struct list_head list; /* protected by objcg_lock */
+		struct list_head list;
 		struct rcu_head rcu;
 	};
 };
@@ -300,8 +307,7 @@ struct mem_cgroup {
 	int kmemcg_id;
 	enum memcg_kmem_state kmem_state;
 	struct obj_cgroup __rcu *objcg;
-	/* list of inherited objcgs, protected by objcg_lock */
-	struct list_head objcg_list;
+	struct list_head objcg_list; /* list of inherited objcgs */
 #endif
 
 	MEMCG_PADDING(_pad2_);
@@ -345,9 +351,6 @@ struct mem_cgroup {
 
 extern struct mem_cgroup *root_mem_cgroup;
 
-struct lruvec *page_to_lruvec(struct page *page, pg_data_t *pgdat);
-void do_traversal_all_lruvec(void);
-
 static __always_inline bool memcg_stat_item_in_bytes(int idx)
 {
 	if (idx == MEMCG_PERCPU_B)
@@ -366,7 +369,7 @@ static inline bool mem_cgroup_disabled(void)
 }
 
 static inline void mem_cgroup_protection(struct mem_cgroup *root,
-					 struct mem_cgroup *memcg,
+						  struct mem_cgroup *memcg,
 					 unsigned long *min,
 					 unsigned long *low)
 {
@@ -972,15 +975,6 @@ void split_page_memcg(struct page *head, unsigned int nr);
 
 struct mem_cgroup;
 
-static inline struct lruvec *page_to_lruvec(struct page *page, pg_data_t *pgdat)
-{
-	return NULL;
-}
-
-static inline void do_traversal_all_lruvec(void)
-{
-}
-
 static inline bool mem_cgroup_is_root(struct mem_cgroup *memcg)
 {
 	return true;
@@ -1002,7 +996,7 @@ static inline void memcg_memory_event_mm(struct mm_struct *mm,
 }
 
 static inline void mem_cgroup_protection(struct mem_cgroup *root,
-					 struct mem_cgroup *memcg,
+						  struct mem_cgroup *memcg,
 					 unsigned long *min,
 					 unsigned long *low)
 {

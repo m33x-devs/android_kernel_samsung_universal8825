@@ -3,11 +3,18 @@
 # Cryptographic API
 #
 
+# CMVP functional test
+#ccflags-y += -DCONFIG_CRYPTO_FIPS_FUNC_TEST
+obj-$(CONFIG_CRYPTO_FIPS) += fips140_out.o
+obj-$(CONFIG_CRYPTO_FIPS) += fips140_integrity.o
+obj-$(CONFIG_CRYPTO_FIPS) += fips140_post.o
+obj-$(CONFIG_CRYPTO_FIPS) += fips140_test.o
+obj-$(CONFIG_CRYPTO_FIPS) += fips140_test_tv.o
+
 obj-$(CONFIG_CRYPTO) += crypto.o
-crypto-y := api.o cipher.o compress.o
+crypto-y := api.o cipher.o compress.o memneq.o
 
 obj-$(CONFIG_CRYPTO_ENGINE) += crypto_engine.o
-obj-$(CONFIG_CRYPTO_FIPS) += fips.o
 
 crypto_algapi-$(CONFIG_PROC_FS) += proc.o
 crypto_algapi-y := algapi.o scatterwalk.o $(crypto_algapi-y)
@@ -211,7 +218,7 @@ UBSAN_SANITIZE_jitterentropy-fips.o = n
 # module that is in scope for FIPS 140-2 certification
 #
 crypto-fips-objs := drbg.o ecb.o cbc.o ctr.o cts.o gcm.o xts.o hmac.o cmac.o \
-		    gf128mul.o aes_generic.o lib-crypto-aes.o \
+		    memneq.o gf128mul.o aes_generic.o lib-crypto-aes.o \
 		    jitterentropy.o jitterentropy-kcapi.o \
 		    sha1_generic.o sha256_generic.o sha512_generic.o \
 		    lib-sha1.o lib-crypto-sha256.o

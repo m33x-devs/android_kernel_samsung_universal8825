@@ -655,8 +655,8 @@ static void nvme_rdma_free_queue(struct nvme_rdma_queue *queue)
 	if (!test_and_clear_bit(NVME_RDMA_Q_ALLOCATED, &queue->flags))
 		return;
 
-	rdma_destroy_id(queue->cm_id);
 	nvme_rdma_destroy_queue_ib(queue);
+	rdma_destroy_id(queue->cm_id);
 	mutex_destroy(&queue->queue_lock);
 }
 
@@ -1057,14 +1057,6 @@ static void nvme_rdma_teardown_io_queues(struct nvme_rdma_ctrl *ctrl,
 	}
 }
 
-static void nvme_rdma_stop_ctrl(struct nvme_ctrl *nctrl)
-{
-	struct nvme_rdma_ctrl *ctrl = to_rdma_ctrl(nctrl);
-
-	cancel_work_sync(&ctrl->err_work);
-	cancel_delayed_work_sync(&ctrl->reconnect_work);
-}
-
 static void nvme_rdma_free_ctrl(struct nvme_ctrl *nctrl)
 {
 	struct nvme_rdma_ctrl *ctrl = to_rdma_ctrl(nctrl);
@@ -1111,13 +1103,11 @@ static int nvme_rdma_setup_ctrl(struct nvme_rdma_ctrl *ctrl, bool new)
 		return ret;
 
 	if (ctrl->ctrl.icdoff) {
-		ret = -EOPNOTSUPP;
 		dev_err(ctrl->ctrl.device, "icdoff is not supported!\n");
 		goto destroy_admin;
 	}
 
 	if (!(ctrl->ctrl.sgls & (1 << 2))) {
-		ret = -EOPNOTSUPP;
 		dev_err(ctrl->ctrl.device,
 			"Mandatory keyed sgls are not supported!\n");
 		goto destroy_admin;
@@ -1208,7 +1198,6 @@ static void nvme_rdma_error_recovery_work(struct work_struct *work)
 			struct nvme_rdma_ctrl, err_work);
 
 	nvme_stop_keep_alive(&ctrl->ctrl);
-	flush_work(&ctrl->ctrl.async_event_work);
 	nvme_rdma_teardown_io_queues(ctrl, false);
 	nvme_start_queues(&ctrl->ctrl);
 	nvme_rdma_teardown_admin_queue(ctrl, false);
@@ -1749,10 +1738,10 @@ static void nvme_rdma_process_nvme_rsp(struct nvme_rdma_queue *queue,
 	struct request *rq;
 	struct nvme_rdma_request *req;
 
-	rq = nvme_find_rq(nvme_rdma_tagset(queue), cqe->command_id);
+	rq = blk_mq_tag_to_rq(nvme_rdma_tagset(queue), cqe->command_id);
 	if (!rq) {
 		dev_err(queue->ctrl->ctrl.device,
-			"got bad command_id %#x on QP %#x\n",
+			"tag 0x%x on QP %#x not found\n",
 			cqe->command_id, queue->qp->qp_num);
 		nvme_rdma_error_recovery(queue->ctrl);
 		return;
@@ -1834,10 +1823,14 @@ static int nvme_rdma_conn_established(struct nvme_rdma_queue *queue)
 	for (i = 0; i < queue->queue_size; i++) {
 		ret = nvme_rdma_post_recv(queue, &queue->rsp_ring[i]);
 		if (ret)
-			return ret;
+			goto out_destroy_queue_ib;
 	}
 
 	return 0;
+
+out_destroy_queue_ib:
+	nvme_rdma_destroy_queue_ib(queue);
+	return ret;
 }
 
 static int nvme_rdma_conn_rejected(struct nvme_rdma_queue *queue,
@@ -1931,10 +1924,14 @@ static int nvme_rdma_route_resolved(struct nvme_rdma_queue *queue)
 	if (ret) {
 		dev_err(ctrl->ctrl.device,
 			"rdma_connect_locked failed (%d).\n", ret);
-		return ret;
+		goto out_destroy_queue_ib;
 	}
 
 	return 0;
+
+out_destroy_queue_ib:
+	nvme_rdma_destroy_queue_ib(queue);
+	return ret;
 }
 
 static int nvme_rdma_cm_handler(struct rdma_cm_id *cm_id,
@@ -1965,6 +1962,8 @@ static int nvme_rdma_cm_handler(struct rdma_cm_id *cm_id,
 	case RDMA_CM_EVENT_ROUTE_ERROR:
 	case RDMA_CM_EVENT_CONNECT_ERROR:
 	case RDMA_CM_EVENT_UNREACHABLE:
+		nvme_rdma_destroy_queue_ib(queue);
+		fallthrough;
 	case RDMA_CM_EVENT_ADDR_ERROR:
 		dev_dbg(queue->ctrl->ctrl.device,
 			"CM error event %d\n", ev->event);
@@ -2244,6 +2243,9 @@ static const struct blk_mq_ops nvme_rdma_admin_mq_ops = {
 
 static void nvme_rdma_shutdown_ctrl(struct nvme_rdma_ctrl *ctrl, bool shutdown)
 {
+	cancel_work_sync(&ctrl->err_work);
+	cancel_delayed_work_sync(&ctrl->reconnect_work);
+
 	nvme_rdma_teardown_io_queues(ctrl, shutdown);
 	blk_mq_quiesce_queue(ctrl->ctrl.admin_q);
 	if (shutdown)
@@ -2293,7 +2295,6 @@ static const struct nvme_ctrl_ops nvme_rdma_ctrl_ops = {
 	.submit_async_event	= nvme_rdma_submit_async_event,
 	.delete_ctrl		= nvme_rdma_delete_ctrl,
 	.get_address		= nvmf_get_address,
-	.stop_ctrl		= nvme_rdma_stop_ctrl,
 };
 
 /*

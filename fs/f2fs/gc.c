@@ -68,8 +68,7 @@ static int gc_thread_func(void *data)
 
 		if (time_to_inject(sbi, FAULT_CHECKPOINT)) {
 			f2fs_show_injection_info(sbi, FAULT_CHECKPOINT);
-			f2fs_stop_checkpoint(sbi, false,
-					STOP_CP_REASON_FAULT_INJECT);
+			f2fs_stop_checkpoint(sbi, false);
 		}
 
 		if (!sb_start_write_trylock(sbi->sb)) {
@@ -92,21 +91,21 @@ static int gc_thread_func(void *data)
 		 */
 		if (sbi->gc_mode == GC_URGENT_HIGH) {
 			wait_ms = gc_th->urgent_sleep_time;
-			f2fs_down_write(&sbi->gc_lock);
+			down_write(&sbi->gc_lock);
 			goto do_gc;
 		}
 
 		if (foreground) {
-			f2fs_down_write(&sbi->gc_lock);
+			down_write(&sbi->gc_lock);
 			goto do_gc;
-		} else if (!f2fs_down_write_trylock(&sbi->gc_lock)) {
+		} else if (!down_write_trylock(&sbi->gc_lock)) {
 			stat_other_skip_bggc_count(sbi);
 			goto next;
 		}
 
 		if (!is_idle(sbi, GC_TIME)) {
 			increase_sleep_time(gc_th, &wait_ms);
-			f2fs_up_write(&sbi->gc_lock);
+			up_write(&sbi->gc_lock);
 			stat_io_skip_bggc_count(sbi);
 			goto next;
 		}
@@ -773,6 +772,11 @@ retry:
 			goto next;
 		}
 
+		/* W/A for FG_GC failure due to Atomic Write File and Pinned File */
+		if (!(p.alloc_mode == SSR || p.alloc_mode == AT_SSR) &&
+				test_bit(secno, dirty_i->unable_victim_secmap))
+			goto next;
+
 		cost = get_gc_cost(sbi, segno, &p);
 
 		if (p.min_cost > cost) {
@@ -942,7 +946,7 @@ next_step:
 			continue;
 		}
 
-		if (f2fs_get_node_info(sbi, nid, &ni, false)) {
+		if (f2fs_get_node_info(sbi, nid, &ni)) {
 			f2fs_put_page(node_page, 1);
 			continue;
 		}
@@ -956,6 +960,7 @@ next_step:
 		if (!err && gc_type == FG_GC)
 			submitted++;
 		stat_inc_node_blk_count(sbi, 1, gc_type);
+		sbi->sec_stat.gc_node_blk_count[gc_type]++;
 	}
 
 	if (++phase < 3)
@@ -1010,7 +1015,7 @@ static bool is_alive(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
 	if (IS_ERR(node_page))
 		return false;
 
-	if (f2fs_get_node_info(sbi, nid, dni, false)) {
+	if (f2fs_get_node_info(sbi, nid, dni)) {
 		f2fs_put_page(node_page, 1);
 		return false;
 	}
@@ -1019,11 +1024,6 @@ static bool is_alive(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
 		f2fs_warn(sbi, "%s: valid data with mismatched node version.",
 			  __func__);
 		set_sbi_flag(sbi, SBI_NEED_FSCK);
-	}
-
-	if (f2fs_check_nid_range(sbi, dni->ino)) {
-		f2fs_put_page(node_page, 1);
-		return false;
 	}
 
 	*nofs = ofs_of_node(node_page);
@@ -1054,7 +1054,7 @@ static int ra_data_block(struct inode *inode, pgoff_t index)
 	struct address_space *mapping = inode->i_mapping;
 	struct dnode_of_data dn;
 	struct page *page;
-	struct extent_info ei = {0, };
+	struct extent_info ei = {0, 0, 0};
 	struct f2fs_io_info fio = {
 		.sbi = sbi,
 		.ino = inode->i_ino,
@@ -1072,7 +1072,7 @@ static int ra_data_block(struct inode *inode, pgoff_t index)
 	if (!page)
 		return -ENOMEM;
 
-	if (f2fs_lookup_read_extent_cache(inode, index, &ei)) {
+	if (f2fs_lookup_extent_cache(inode, index, &ei)) {
 		dn.data_blkaddr = ei.blk + index - ei.fofs;
 		if (unlikely(!f2fs_is_valid_blkaddr(sbi, dn.data_blkaddr,
 						DATA_GENERIC_ENHANCE_READ))) {
@@ -1164,6 +1164,8 @@ static int move_data_block(struct inode *inode, block_t bidx,
 				(fio.sbi->gc_mode != GC_URGENT_HIGH) ?
 				CURSEG_ALL_DATA_ATGC : CURSEG_COLD_DATA;
 
+	f2fs_cond_set_fua(&fio);
+
 	/* do not read out */
 	page = f2fs_grab_cache_page(inode->i_mapping, bidx, false);
 	if (!page)
@@ -1175,6 +1177,9 @@ static int move_data_block(struct inode *inode, block_t bidx,
 	}
 
 	if (f2fs_is_atomic_file(inode)) {
+		/* W/A for FG_GC failure due to Atomic Write File */
+		set_bit(GET_SEC_FROM_SEG(F2FS_I_SB(inode), segno),
+			DIRTY_I(F2FS_I_SB(inode))->unable_victim_secmap);
 		F2FS_I(inode)->i_gc_failures[GC_FAILURE_ATOMIC]++;
 		F2FS_I_SB(inode)->skipped_atomic_files[gc_type]++;
 		err = -EAGAIN;
@@ -1182,7 +1187,9 @@ static int move_data_block(struct inode *inode, block_t bidx,
 	}
 
 	if (f2fs_is_pinned_file(inode)) {
-		f2fs_pin_file_control(inode, true);
+		/* W/A for GC failure due to Pinned File */
+		set_bit(GET_SEC_FROM_SEG(F2FS_I_SB(inode), segno),
+			DIRTY_I(F2FS_I_SB(inode))->unable_victim_secmap);
 		err = -EAGAIN;
 		goto out;
 	}
@@ -1206,7 +1213,7 @@ static int move_data_block(struct inode *inode, block_t bidx,
 
 	f2fs_wait_on_block_writeback(inode, dn.data_blkaddr);
 
-	err = f2fs_get_node_info(fio.sbi, dn.nid, &ni, false);
+	err = f2fs_get_node_info(fio.sbi, dn.nid, &ni);
 	if (err)
 		goto put_out;
 
@@ -1215,7 +1222,7 @@ static int move_data_block(struct inode *inode, block_t bidx,
 	fio.new_blkaddr = fio.old_blkaddr = dn.data_blkaddr;
 
 	if (lfs_mode)
-		f2fs_down_write(&fio.sbi->io_order_lock);
+		down_write(&fio.sbi->io_order_lock);
 
 	mpage = f2fs_grab_cache_page(META_MAPPING(fio.sbi),
 					fio.old_blkaddr, false);
@@ -1301,7 +1308,7 @@ recover_block:
 							true, true, true);
 up_out:
 	if (lfs_mode)
-		f2fs_up_write(&fio.sbi->io_order_lock);
+		up_write(&fio.sbi->io_order_lock);
 put_out:
 	f2fs_put_dnode(&dn);
 out:
@@ -1325,14 +1332,20 @@ static int move_data_page(struct inode *inode, block_t bidx, int gc_type,
 	}
 
 	if (f2fs_is_atomic_file(inode)) {
+		/* W/A for FG_GC failure due to Atomic Write File */
+		set_bit(GET_SEC_FROM_SEG(F2FS_I_SB(inode), segno),
+			DIRTY_I(F2FS_I_SB(inode))->unable_victim_secmap);
 		F2FS_I(inode)->i_gc_failures[GC_FAILURE_ATOMIC]++;
 		F2FS_I_SB(inode)->skipped_atomic_files[gc_type]++;
 		err = -EAGAIN;
 		goto out;
 	}
 	if (f2fs_is_pinned_file(inode)) {
-		if (gc_type == FG_GC)
-			f2fs_pin_file_control(inode, true);
+		if (gc_type == FG_GC) {
+			/* W/A for FG_GC failure due to Pinned File */
+			set_bit(GET_SEC_FROM_SEG(F2FS_I_SB(inode), segno),
+				DIRTY_I(F2FS_I_SB(inode))->unable_victim_secmap);
+		}
 		err = -EAGAIN;
 		goto out;
 	}
@@ -1360,6 +1373,7 @@ static int move_data_page(struct inode *inode, block_t bidx, int gc_type,
 		};
 		bool is_dirty = PageDirty(page);
 
+		f2fs_cond_set_fua(&fio);
 retry:
 		f2fs_wait_on_page_writeback(page, DATA, true, true);
 
@@ -1460,7 +1474,7 @@ next_step:
 			if (IS_ERR(inode) || is_bad_inode(inode))
 				continue;
 
-			if (!f2fs_down_write_trylock(
+			if (!down_write_trylock(
 				&F2FS_I(inode)->i_gc_rwsem[WRITE])) {
 				iput(inode);
 				sbi->skipped_gc_rwsem++;
@@ -1473,7 +1487,7 @@ next_step:
 			if (f2fs_post_read_required(inode)) {
 				int err = ra_data_block(inode, start_bidx);
 
-				f2fs_up_write(&F2FS_I(inode)->i_gc_rwsem[WRITE]);
+				up_write(&F2FS_I(inode)->i_gc_rwsem[WRITE]);
 				if (err) {
 					iput(inode);
 					continue;
@@ -1484,7 +1498,7 @@ next_step:
 
 			data_page = f2fs_get_read_data_page(inode,
 						start_bidx, REQ_RAHEAD, true);
-			f2fs_up_write(&F2FS_I(inode)->i_gc_rwsem[WRITE]);
+			up_write(&F2FS_I(inode)->i_gc_rwsem[WRITE]);
 			if (IS_ERR(data_page)) {
 				iput(inode);
 				continue;
@@ -1503,14 +1517,12 @@ next_step:
 			int err;
 
 			if (S_ISREG(inode->i_mode)) {
-				if (!f2fs_down_write_trylock(&fi->i_gc_rwsem[READ])) {
-					sbi->skipped_gc_rwsem++;
+				if (!down_write_trylock(&fi->i_gc_rwsem[READ]))
 					continue;
-				}
-				if (!f2fs_down_write_trylock(
+				if (!down_write_trylock(
 						&fi->i_gc_rwsem[WRITE])) {
 					sbi->skipped_gc_rwsem++;
-					f2fs_up_write(&fi->i_gc_rwsem[READ]);
+					up_write(&fi->i_gc_rwsem[READ]);
 					continue;
 				}
 				locked = true;
@@ -1533,11 +1545,12 @@ next_step:
 				submitted++;
 
 			if (locked) {
-				f2fs_up_write(&fi->i_gc_rwsem[WRITE]);
-				f2fs_up_write(&fi->i_gc_rwsem[READ]);
+				up_write(&fi->i_gc_rwsem[WRITE]);
+				up_write(&fi->i_gc_rwsem[READ]);
 			}
 
 			stat_inc_data_blk_count(sbi, 1, gc_type);
+			sbi->sec_stat.gc_data_blk_count[gc_type]++;
 		}
 	}
 
@@ -1634,8 +1647,7 @@ static int do_garbage_collect(struct f2fs_sb_info *sbi,
 			f2fs_err(sbi, "Inconsistent segment (%u) type [%d, %d] in SSA and SIT",
 				 segno, type, GET_SUM_TYPE((&sum->footer)));
 			set_sbi_flag(sbi, SBI_NEED_FSCK);
-			f2fs_stop_checkpoint(sbi, false,
-				STOP_CP_REASON_CORRUPTED_SUMMARY);
+			f2fs_stop_checkpoint(sbi, false);
 			goto skip;
 		}
 
@@ -1646,14 +1658,16 @@ static int do_garbage_collect(struct f2fs_sb_info *sbi,
 		 *   - down_read(sentry_lock)     - change_curseg()
 		 *                                  - lock_page(sum_page)
 		 */
-		if (type == SUM_TYPE_NODE)
+		if (type == SUM_TYPE_NODE) {
 			submitted += gc_node_segment(sbi, sum->entries, segno,
 								gc_type);
-		else
+			sbi->sec_stat.gc_node_seg_count[gc_type]++;
+		} else {
 			submitted += gc_data_segment(sbi, sum->entries, gc_list,
 							segno, gc_type,
 							force_migrate);
-
+			sbi->sec_stat.gc_data_seg_count[gc_type]++;
+		}
 		stat_inc_seg_count(sbi, type, gc_type);
 		sbi->gc_reclaimed_segs[sbi->gc_mode]++;
 		migrated++;
@@ -1680,8 +1694,20 @@ skip:
 	return seg_freed;
 }
 
-int f2fs_gc(struct f2fs_sb_info *sbi, bool sync,
-			bool background, bool force, unsigned int segno)
+/* For record miliseconds */
+#define	GC_TIME_RECORD_UNIT	1000000
+static void f2fs_update_gc_total_time(struct f2fs_sb_info *sbi,
+		unsigned long long start, unsigned long long end, int gc_type)
+{
+	if (!((end - start) / GC_TIME_RECORD_UNIT))
+		sbi->sec_stat.gc_ttime[gc_type]++;
+	else
+		sbi->sec_stat.gc_ttime[gc_type] += ((end - start) / GC_TIME_RECORD_UNIT);
+}
+
+/* @fs.sec -- 83e29a36b9fb739ea211c0c67aefc4c8 -- */
+int __f2fs_gc(struct f2fs_sb_info *sbi, bool sync, bool background, bool force,
+			unsigned int segno, bool init_unable_victim_map)
 {
 	int gc_type = sync ? FG_GC : BG_GC;
 	int sec_freed = 0, seg_freed = 0, total_freed = 0;
@@ -1693,7 +1719,7 @@ int f2fs_gc(struct f2fs_sb_info *sbi, bool sync,
 		.iroot = RADIX_TREE_INIT(gc_list.iroot, GFP_NOFS),
 	};
 	unsigned long long last_skipped = sbi->skipped_atomic_files[FG_GC];
-	unsigned long long first_skipped;
+	unsigned long long first_skipped, gc_start_time = 0, gc_end_time = 0;
 	unsigned int skipped_round = 0, round = 0;
 
 	trace_f2fs_gc_begin(sbi->sb, sync, background,
@@ -1705,6 +1731,12 @@ int f2fs_gc(struct f2fs_sb_info *sbi, bool sync,
 				reserved_segments(sbi),
 				prefree_segments(sbi));
 
+	/* W/A for FG_GC failure due to Atomic Write File and Pinned File */
+	if (init_unable_victim_map)
+		memset(DIRTY_I(sbi)->unable_victim_secmap, 0,
+					f2fs_bitmap_size(MAIN_SECS(sbi)));
+
+	gc_start_time = local_clock();
 	cpc.reason = __get_cp_reason(sbi);
 	sbi->skipped_gc_rwsem = 0;
 	first_skipped = last_skipped;
@@ -1718,7 +1750,7 @@ gc_more:
 		goto stop;
 	}
 
-	if (gc_type == BG_GC && has_not_enough_free_secs(sbi, 0, 0)) {
+	if (has_not_enough_free_secs(sbi, (gc_type == BG_GC) ? 0 : sec_freed, 0)) {
 		/*
 		 * For example, if there are many prefree_segments below given
 		 * threshold, we can make them free by checkpoint. Then, we
@@ -1730,7 +1762,7 @@ gc_more:
 			if (ret)
 				goto stop;
 		}
-		if (has_not_enough_free_secs(sbi, 0, 0))
+		if (gc_type == BG_GC && has_not_enough_free_secs(sbi, 0, 0))
 			gc_type = FG_GC;
 	}
 
@@ -1784,6 +1816,7 @@ stop:
 	SIT_I(sbi)->last_victim[ALLOC_NEXT] = 0;
 	SIT_I(sbi)->last_victim[FLUSH_DEVICE] = init_segno;
 
+	gc_end_time = local_clock();
 	trace_f2fs_gc_end(sbi->sb, ret, total_freed, sec_freed,
 				get_pages(sbi, F2FS_DIRTY_NODES),
 				get_pages(sbi, F2FS_DIRTY_DENTS),
@@ -1793,7 +1826,10 @@ stop:
 				reserved_segments(sbi),
 				prefree_segments(sbi));
 
-	f2fs_up_write(&sbi->gc_lock);
+	sbi->sec_stat.gc_count[gc_type]++;
+	f2fs_update_gc_total_time(sbi, gc_start_time, gc_end_time, gc_type);
+
+	up_write(&sbi->gc_lock);
 
 	put_gc_inode(&gc_list);
 
@@ -1922,7 +1958,7 @@ static void update_sb_metadata(struct f2fs_sb_info *sbi, int secs)
 	long long block_count;
 	int segs = secs * sbi->segs_per_sec;
 
-	f2fs_down_write(&sbi->sb_lock);
+	down_write(&sbi->sb_lock);
 
 	section_count = le32_to_cpu(raw_sb->section_count);
 	segment_count = le32_to_cpu(raw_sb->segment_count);
@@ -1943,7 +1979,7 @@ static void update_sb_metadata(struct f2fs_sb_info *sbi, int secs)
 						cpu_to_le32(dev_segs + segs);
 	}
 
-	f2fs_up_write(&sbi->sb_lock);
+	up_write(&sbi->sb_lock);
 }
 
 static void update_fs_metadata(struct f2fs_sb_info *sbi, int secs)
@@ -2017,7 +2053,7 @@ int f2fs_resize_fs(struct f2fs_sb_info *sbi, __u64 block_count)
 	secs = div_u64(shrunk_blocks, BLKS_PER_SEC(sbi));
 
 	/* stop other GC */
-	if (!f2fs_down_write_trylock(&sbi->gc_lock))
+	if (!down_write_trylock(&sbi->gc_lock))
 		return -EAGAIN;
 
 	/* stop CP to protect MAIN_SEC in free_segment_range */
@@ -2037,15 +2073,15 @@ int f2fs_resize_fs(struct f2fs_sb_info *sbi, __u64 block_count)
 
 out_unlock:
 	f2fs_unlock_op(sbi);
-	f2fs_up_write(&sbi->gc_lock);
+	up_write(&sbi->gc_lock);
 	if (err)
 		return err;
 
 	set_sbi_flag(sbi, SBI_IS_RESIZEFS);
 
 	freeze_super(sbi->sb);
-	f2fs_down_write(&sbi->gc_lock);
-	f2fs_down_write(&sbi->cp_global_sem);
+	down_write(&sbi->gc_lock);
+	down_write(&sbi->cp_global_sem);
 
 	spin_lock(&sbi->stat_lock);
 	if (shrunk_blocks + valid_user_blocks(sbi) +
@@ -2090,8 +2126,8 @@ recover_out:
 		spin_unlock(&sbi->stat_lock);
 	}
 out_err:
-	f2fs_up_write(&sbi->cp_global_sem);
-	f2fs_up_write(&sbi->gc_lock);
+	up_write(&sbi->cp_global_sem);
+	up_write(&sbi->gc_lock);
 	thaw_super(sbi->sb);
 	clear_sbi_flag(sbi, SBI_IS_RESIZEFS);
 	return err;

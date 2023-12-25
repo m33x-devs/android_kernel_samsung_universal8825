@@ -1509,6 +1509,10 @@ static void pagetypeinfo_showblockcount_print(struct seq_file *m,
 		if (!page)
 			continue;
 
+		/* Watch for unexpected holes punched in the memmap */
+		if (!memmap_valid_within(pfn, page, zone))
+			continue;
+
 		if (page_zone(page) != zone)
 			continue;
 
@@ -1807,7 +1811,7 @@ static const struct seq_operations vmstat_op = {
 
 #ifdef CONFIG_SMP
 static DEFINE_PER_CPU(struct delayed_work, vmstat_work);
-int sysctl_stat_interval __read_mostly = HZ;
+int sysctl_stat_interval __read_mostly = (10 * HZ);
 
 #ifdef CONFIG_PROC_FS
 static void refresh_vm_stats(struct work_struct *work)

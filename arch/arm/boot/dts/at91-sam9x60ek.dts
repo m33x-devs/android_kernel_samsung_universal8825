@@ -233,9 +233,10 @@
 		status = "okay";
 
 		eeprom@53 {
-			compatible = "atmel,24c02";
+			compatible = "atmel,24c32";
 			reg = <0x53>;
 			pagesize = <16>;
+			size = <128>;
 			status = "okay";
 		};
 	};
@@ -661,7 +662,7 @@
 };
 
 &shutdown_controller {
-	debounce-delay-us = <976>;
+	atmel,shdwc-debouncer = <976>;
 	status = "okay";
 
 	input@0 {

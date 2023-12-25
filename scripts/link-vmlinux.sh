@@ -129,9 +129,6 @@ objtool_link()
 			objtoolcmd="check"
 		fi
 		objtoolopt="${objtoolopt} --vmlinux"
-		if [ -n "${CONFIG_CPU_UNRET_ENTRY}" ]; then
-			objtoolopt="${objtoolopt} --unret"
-		fi
 		if [ -z "${CONFIG_FRAME_POINTER}" ]; then
 			objtoolopt="${objtoolopt} --no-fp"
 		fi
@@ -143,9 +140,6 @@ objtool_link()
 		fi
 		if [ -n "${CONFIG_X86_SMAP}" ]; then
 			objtoolopt="${objtoolopt} --uaccess"
-		fi
-		if [ -n "${CONFIG_SLS}" ]; then
-			objtoolopt="${objtoolopt} --sls"
 		fi
 		info OBJTOOL ${1}
 		tools/objtool/objtool ${objtoolcmd} ${objtoolopt} ${1}
@@ -455,4 +449,10 @@ if [ -n "${CONFIG_KALLSYMS}" ]; then
 		echo >&2 Try "make KALLSYMS_EXTRA_PASS=1" as a workaround
 		exit 1
 	fi
+fi
+
+if [ -n "${CONFIG_CRYPTO_FIPS}" ]; then
+	echo '  FIPS : Generating hmac of crypto and updating vmlinux... '
+	PYTHONDONTWRITEBYTECODE=0 "${srctree}/scripts/crypto/fips_crypto_integrity.py" \
+		"${objtree}/vmlinux" "${objtree}/crypto" "${objtree}/arch/arm64/crypto"
 fi

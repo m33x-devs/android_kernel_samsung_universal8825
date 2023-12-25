@@ -301,7 +301,7 @@ struct uart_state {
 	struct uart_port	*uart_port;
 };
 
-#define UART_XMIT_SIZE	PAGE_SIZE
+#define UART_XMIT_SIZE	(PAGE_SIZE * 4)
 
 
 /* number of characters left in xmit buffer before we ask for more */
@@ -403,11 +403,6 @@ static const bool earlycon_acpi_spcr_enable EARLYCON_USED_OR_UNUSED;
 static inline int setup_earlycon(char *buf) { return 0; }
 #endif
 
-static inline bool uart_console_enabled(struct uart_port *port)
-{
-	return uart_console(port) && (port->cons->flags & CON_ENABLED);
-}
-
 struct uart_port *uart_get_console(struct uart_port *ports, int nr,
 				   struct console *c);
 int uart_parse_earlycon(char *p, unsigned char *iotype, resource_size_t *addr,
@@ -476,8 +471,6 @@ extern void uart_handle_cts_change(struct uart_port *uport,
 
 extern void uart_insert_char(struct uart_port *port, unsigned int status,
 		 unsigned int overrun, unsigned int ch, unsigned int flag);
-
-void uart_xchar_out(struct uart_port *uport, int offset);
 
 #ifdef CONFIG_MAGIC_SYSRQ_SERIAL
 #define SYSRQ_TIMEOUT	(HZ * 5)

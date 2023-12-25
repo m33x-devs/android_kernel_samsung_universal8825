@@ -1192,6 +1192,12 @@ static int qcom_pcie_init_2_7_0(struct qcom_pcie *pcie)
 		goto err_disable_clocks;
 	}
 
+	ret = clk_prepare_enable(res->pipe_clk);
+	if (ret) {
+		dev_err(dev, "cannot prepare/enable pipe clock\n");
+		goto err_disable_clocks;
+	}
+
 	/* configure PCIe to RC mode */
 	writel(DEVICE_TYPE_RC, pcie->parf + PCIE20_PARF_DEVICE_TYPE);
 
@@ -1437,21 +1443,22 @@ static int qcom_pcie_probe(struct platform_device *pdev)
 	}
 
 	ret = phy_init(pcie->phy);
-	if (ret)
+	if (ret) {
+		pm_runtime_disable(&pdev->dev);
 		goto err_pm_runtime_put;
+	}
 
 	platform_set_drvdata(pdev, pcie);
 
 	ret = dw_pcie_host_init(pp);
 	if (ret) {
 		dev_err(dev, "cannot initialize host\n");
-		goto err_phy_exit;
+		pm_runtime_disable(&pdev->dev);
+		goto err_pm_runtime_put;
 	}
 
 	return 0;
 
-err_phy_exit:
-	phy_exit(pcie->phy);
 err_pm_runtime_put:
 	pm_runtime_put(dev);
 	pm_runtime_disable(dev);

@@ -210,11 +210,7 @@ static void move_ptes(struct vm_area_struct *vma, pmd_t *old_pmd,
 		drop_rmap_locks(vma);
 }
 
-/*
- * Speculative page fault handlers will not detect page table changes done
- * without ptl locking.
- */
-#if defined(CONFIG_HAVE_MOVE_PMD) && !defined(CONFIG_SPECULATIVE_PAGE_FAULT)
+#ifdef CONFIG_HAVE_MOVE_PMD
 static bool move_normal_pmd(struct vm_area_struct *vma, unsigned long old_addr,
 		  unsigned long new_addr, pmd_t *old_pmd, pmd_t *new_pmd)
 {
@@ -281,11 +277,7 @@ static inline bool move_normal_pmd(struct vm_area_struct *vma,
 }
 #endif
 
-/*
- * Speculative page fault handlers will not detect page table changes done
- * without ptl locking.
- */
-#if defined(CONFIG_HAVE_MOVE_PUD) && !defined(CONFIG_SPECULATIVE_PAGE_FAULT)
+#ifdef CONFIG_HAVE_MOVE_PUD
 static bool move_normal_pud(struct vm_area_struct *vma, unsigned long old_addr,
 		  unsigned long new_addr, pud_t *old_pud, pud_t *new_pud)
 {
@@ -423,9 +415,6 @@ unsigned long move_page_tables(struct vm_area_struct *vma,
 	unsigned long extent, old_end;
 	struct mmu_notifier_range range;
 	pmd_t *old_pmd, *new_pmd;
-
-	if (!len)
-		return 0;
 
 	old_end = old_addr + len;
 	flush_cache_range(vma, old_addr, old_end);

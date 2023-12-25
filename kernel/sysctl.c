@@ -104,6 +104,10 @@
 #include <linux/nmi.h>
 #endif
 
+#ifdef CONFIG_HUGEPAGE_POOL
+#include <linux/hugepage_pool.h>
+#endif
+
 #if defined(CONFIG_SYSCTL)
 
 /* External variables not in a header file. */
@@ -560,14 +564,14 @@ static int do_proc_dointvec_conv(bool *negp, unsigned long *lvalp,
 		if (*negp) {
 			if (*lvalp > (unsigned long) INT_MAX + 1)
 				return -EINVAL;
-			WRITE_ONCE(*valp, -*lvalp);
+			*valp = -*lvalp;
 		} else {
 			if (*lvalp > (unsigned long) INT_MAX)
 				return -EINVAL;
-			WRITE_ONCE(*valp, *lvalp);
+			*valp = *lvalp;
 		}
 	} else {
-		int val = READ_ONCE(*valp);
+		int val = *valp;
 		if (val < 0) {
 			*negp = true;
 			*lvalp = -(unsigned long)val;
@@ -586,9 +590,9 @@ static int do_proc_douintvec_conv(unsigned long *lvalp,
 	if (write) {
 		if (*lvalp > UINT_MAX)
 			return -EINVAL;
-		WRITE_ONCE(*valp, *lvalp);
+		*valp = *lvalp;
 	} else {
-		unsigned int val = READ_ONCE(*valp);
+		unsigned int val = *valp;
 		*lvalp = (unsigned long)val;
 	}
 	return 0;
@@ -962,7 +966,7 @@ static int do_proc_dointvec_minmax_conv(bool *negp, unsigned long *lvalp,
 		if ((param->min && *param->min > tmp) ||
 		    (param->max && *param->max < tmp))
 			return -EINVAL;
-		WRITE_ONCE(*valp, tmp);
+		*valp = tmp;
 	}
 
 	return 0;
@@ -1028,7 +1032,7 @@ static int do_proc_douintvec_minmax_conv(unsigned long *lvalp,
 		    (param->max && *param->max < tmp))
 			return -ERANGE;
 
-		WRITE_ONCE(*valp, tmp);
+		*valp = tmp;
 	}
 
 	return 0;
@@ -1196,9 +1200,9 @@ static int __do_proc_doulongvec_minmax(void *data, struct ctl_table *table,
 				err = -EINVAL;
 				break;
 			}
-			WRITE_ONCE(*i, val);
+			*i = val;
 		} else {
-			val = convdiv * READ_ONCE(*i) / convmul;
+			val = convdiv * (*i) / convmul;
 			if (!first)
 				proc_put_char(&buffer, &left, '\t');
 			proc_put_long(&buffer, &left, val, false);
@@ -1279,12 +1283,9 @@ static int do_proc_dointvec_jiffies_conv(bool *negp, unsigned long *lvalp,
 	if (write) {
 		if (*lvalp > INT_MAX / HZ)
 			return 1;
-		if (*negp)
-			WRITE_ONCE(*valp, -*lvalp * HZ);
-		else
-			WRITE_ONCE(*valp, *lvalp * HZ);
+		*valp = *negp ? -(*lvalp*HZ) : (*lvalp*HZ);
 	} else {
-		int val = READ_ONCE(*valp);
+		int val = *valp;
 		unsigned long lval;
 		if (val < 0) {
 			*negp = true;
@@ -1330,9 +1331,9 @@ static int do_proc_dointvec_ms_jiffies_conv(bool *negp, unsigned long *lvalp,
 
 		if (jif > INT_MAX)
 			return 1;
-		WRITE_ONCE(*valp, (int)jif);
+		*valp = (int)jif;
 	} else {
-		int val = READ_ONCE(*valp);
+		int val = *valp;
 		unsigned long lval;
 		if (val < 0) {
 			*negp = true;
@@ -1400,8 +1401,8 @@ int proc_dointvec_userhz_jiffies(struct ctl_table *table, int write,
  * @ppos: the current position in the file
  *
  * Reads/writes up to table->maxlen/sizeof(unsigned int) integer
- * values from/to the user buffer, treated as an ASCII string.
- * The values read are assumed to be in 1/1000 seconds, and
+ * values from/to the user buffer, treated as an ASCII string. 
+ * The values read are assumed to be in 1/1000 seconds, and 
  * are converted into jiffies.
  *
  * Returns 0 on success.
@@ -1832,15 +1833,6 @@ static struct ctl_table kern_table[] = {
 		.mode		= 0644,
 		.proc_handler	= sched_rr_handler,
 	},
-#ifdef CONFIG_SMP
-	{
-		.procname	= "sched_pelt_multiplier",
-		.data		= &sysctl_sched_pelt_multiplier,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= sched_pelt_multiplier,
-	},
-#endif
 #ifdef CONFIG_UCLAMP_TASK
 	{
 		.procname	= "sched_util_clamp_min",
@@ -2826,13 +2818,21 @@ static struct ctl_table vm_table[] = {
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= &two_hundred,
 	},
-#ifdef CONFIG_NUMA
 	{
-		.procname	= "numa_stat",
-		.data		= &sysctl_vm_numa_stat,
-		.maxlen		= sizeof(int),
+		.procname	= "mmap_readaround_limit",
+		.data		= &mmap_readaround_limit,
+		.maxlen		= sizeof(mmap_readaround_limit),
 		.mode		= 0644,
-		.proc_handler	= sysctl_vm_numa_stat_handler,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+	},
+#ifdef CONFIG_HUGEPAGE_POOL
+	{
+		.procname	= "use_hugepage_pool_global",
+		.data		= &use_hugepage_pool_global,
+		.maxlen		= sizeof(use_hugepage_pool_global),
+		.mode		= 0666,
+		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= SYSCTL_ONE,
 	},
@@ -2852,6 +2852,15 @@ static struct ctl_table vm_table[] = {
 		.maxlen         = sizeof(unsigned long),
 		.mode           = 0644,
 		.proc_handler   = &hugetlb_mempolicy_sysctl_handler,
+	},
+	{
+		.procname		= "numa_stat",
+		.data			= &sysctl_vm_numa_stat,
+		.maxlen			= sizeof(int),
+		.mode			= 0644,
+		.proc_handler	= sysctl_vm_numa_stat_handler,
+		.extra1			= SYSCTL_ZERO,
+		.extra2			= SYSCTL_ONE,
 	},
 #endif
 	 {

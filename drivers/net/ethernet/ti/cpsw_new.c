@@ -1255,10 +1255,8 @@ static int cpsw_probe_dt(struct cpsw_common *cpsw)
 	data->slave_data = devm_kcalloc(dev, CPSW_SLAVE_PORTS_NUM,
 					sizeof(struct cpsw_slave_data),
 					GFP_KERNEL);
-	if (!data->slave_data) {
-		of_node_put(tmp_node);
+	if (!data->slave_data)
 		return -ENOMEM;
-	}
 
 	/* Populate all the child nodes here...
 	 */
@@ -1355,7 +1353,6 @@ static int cpsw_probe_dt(struct cpsw_common *cpsw)
 
 err_node_put:
 	of_node_put(port_np);
-	of_node_put(tmp_node);
 	return ret;
 }
 

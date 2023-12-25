@@ -137,7 +137,7 @@ static void tick_sched_do_timer(struct tick_sched *ts, ktime_t now)
 	 */
 	if (unlikely(tick_do_timer_cpu == TICK_DO_TIMER_NONE)) {
 #ifdef CONFIG_NO_HZ_FULL
-		WARN_ON_ONCE(tick_nohz_full_running);
+		WARN_ON(tick_nohz_full_running);
 #endif
 		tick_do_timer_cpu = cpu;
 	}
@@ -428,6 +428,7 @@ void __init tick_nohz_full_setup(cpumask_var_t cpumask)
 	cpumask_copy(tick_nohz_full_mask, cpumask);
 	tick_nohz_full_running = true;
 }
+EXPORT_SYMBOL_GPL(tick_nohz_full_setup);
 
 static int tick_nohz_cpu_down(unsigned int cpu)
 {
@@ -1437,4 +1438,24 @@ int tick_check_oneshot_change(int allow_nohz)
 
 	tick_nohz_switch_to_nohz();
 	return 0;
+}
+
+static struct tick_sched saved_pcpu_ts[NR_CPUS];
+
+void save_pcpu_tick(int cpu)
+{
+	saved_pcpu_ts[cpu] = per_cpu(tick_cpu_sched, cpu);
+	kcpustat_cpu(cpu).cpustat[CPUTIME_IDLE] =
+			ktime_to_ns(saved_pcpu_ts[cpu].idle_sleeptime);
+	kcpustat_cpu(cpu).cpustat[CPUTIME_IOWAIT] =
+			ktime_to_ns(saved_pcpu_ts[cpu].iowait_sleeptime);
+}
+
+void restore_pcpu_tick(int cpu)
+{
+	struct tick_sched *ts = &per_cpu(tick_cpu_sched, cpu);
+
+	ts->idle_sleeptime = saved_pcpu_ts[cpu].idle_sleeptime;
+	ts->iowait_sleeptime = saved_pcpu_ts[cpu].iowait_sleeptime;
+	ts->idle_calls = saved_pcpu_ts[cpu].idle_calls;
 }

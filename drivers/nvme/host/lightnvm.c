@@ -653,7 +653,7 @@ static struct request *nvme_nvm_alloc_request(struct request_queue *q,
 
 	nvme_nvm_rqtocmd(rqd, ns, cmd);
 
-	rq = nvme_alloc_request(q, (struct nvme_command *)cmd, 0);
+	rq = nvme_alloc_request(q, (struct nvme_command *)cmd, 0, NVME_QID_ANY);
 	if (IS_ERR(rq))
 		return rq;
 
@@ -767,14 +767,14 @@ static int nvme_nvm_submit_user_cmd(struct request_queue *q,
 	DECLARE_COMPLETION_ONSTACK(wait);
 	int ret = 0;
 
-	rq = nvme_alloc_request(q, (struct nvme_command *)vcmd, 0);
+	rq = nvme_alloc_request(q, (struct nvme_command *)vcmd, 0,
+			NVME_QID_ANY);
 	if (IS_ERR(rq)) {
 		ret = -ENOMEM;
 		goto err_cmd;
 	}
 
-	if (timeout)
-		rq->timeout = timeout;
+	rq->timeout = timeout ? timeout : ADMIN_TIMEOUT;
 
 	if (ppa_buf && ppa_len) {
 		ppa_list = dma_pool_alloc(dev->dma_pool, GFP_KERNEL, &ppa_dma);

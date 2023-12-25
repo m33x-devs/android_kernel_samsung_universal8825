@@ -97,6 +97,7 @@
 #include <linux/scs.h>
 #include <linux/io_uring.h>
 #include <linux/cpufreq_times.h>
+#include <linux/task_integrity.h>
 
 #include <asm/pgalloc.h>
 #include <linux/uaccess.h>
@@ -111,6 +112,14 @@
 
 #undef CREATE_TRACE_POINTS
 #include <trace/hooks/sched.h>
+
+#ifdef CONFIG_SECURITY_DEFEX
+#include <linux/defex.h>
+#endif
+
+#ifdef CONFIG_KDP_CRED
+#include <linux/kdp.h>
+#endif
 /*
  * Minimum number of threads to boot the kernel
  */
@@ -961,7 +970,6 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 	tsk->splice_pipe = NULL;
 	tsk->task_frag.page = NULL;
 	tsk->wake_q.next = NULL;
-	tsk->pf_io_worker = NULL;
 
 	account_kernel_stack(tsk, 1);
 
@@ -979,10 +987,8 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 #ifdef CONFIG_MEMCG
 	tsk->active_memcg = NULL;
 #endif
-
-	android_init_vendor_data(tsk, 1);
-	android_init_oem_data(tsk, 1);
-
+	memset(&tsk->android_vendor_data1, 0, sizeof(tsk->android_vendor_data1));
+	memset(&tsk->android_oem_data1, 0, sizeof(tsk->android_oem_data1));
 	trace_android_vh_dup_task_struct(tsk, orig);
 	return tsk;
 
@@ -1075,14 +1081,12 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	mm_init_owner(mm, p);
 	mm_init_pasid(mm);
 	RCU_INIT_POINTER(mm->exe_file, NULL);
-	if (!mmu_notifier_subscriptions_init(mm))
-		goto fail_nopgd;
+	mmu_notifier_subscriptions_init(mm);
 	init_tlb_flush_pending(mm);
 #if defined(CONFIG_TRANSPARENT_HUGEPAGE) && !USE_SPLIT_PMD_PTLOCKS
 	mm->pmd_huge_pte = NULL;
 #endif
 	mm_init_uprobes_state(mm);
-	hugetlb_count_init(mm);
 
 	if (current->mm) {
 		mm->flags = current->mm->flags & MMF_INIT_MASK;
@@ -1719,6 +1723,59 @@ init_task_pid(struct task_struct *task, enum pid_type type, struct pid *pid)
 		task->signal->pids[type] = pid;
 }
 
+#ifdef CONFIG_FIVE
+static int dup_task_integrity(unsigned long clone_flags,
+					struct task_struct *tsk)
+{
+	int ret = 0;
+
+	if (clone_flags & CLONE_VM) {
+		task_integrity_get(TASK_INTEGRITY(current));
+		task_integrity_assign(tsk, TASK_INTEGRITY(current));
+	} else {
+		task_integrity_assign(tsk, task_integrity_alloc());
+
+		if (!TASK_INTEGRITY(tsk))
+			ret = -ENOMEM;
+	}
+
+	return ret;
+}
+
+static inline void task_integrity_cleanup(struct task_struct *tsk)
+{
+	task_integrity_put(TASK_INTEGRITY(tsk));
+}
+
+static inline int task_integrity_apply(unsigned long clone_flags,
+						struct task_struct *tsk)
+{
+	int ret = 0;
+
+	if (!(clone_flags & CLONE_VM))
+		ret = five_fork(current, tsk);
+
+	return ret;
+}
+#else
+static inline int dup_task_integrity(unsigned long clone_flags,
+						struct task_struct *tsk)
+{
+	return 0;
+}
+
+static inline void task_integrity_cleanup(struct task_struct *tsk)
+{
+}
+
+static inline int task_integrity_apply(unsigned long clone_flags,
+						struct task_struct *tsk)
+{
+	return 0;
+}
+
+#endif
+
 static inline void rcu_copy_process(struct task_struct *p)
 {
 #ifdef CONFIG_PREEMPT_RCU
@@ -1986,21 +2043,13 @@ static __latent_entropy struct task_struct *copy_process(
 	recalc_sigpending();
 	spin_unlock_irq(&current->sighand->siglock);
 	retval = -ERESTARTNOINTR;
-	if (task_sigpending(current))
+	if (signal_pending(current))
 		goto fork_out;
 
 	retval = -ENOMEM;
 	p = dup_task_struct(current, node);
 	if (!p)
 		goto fork_out;
-	if (args->io_thread) {
-		/*
-		 * Mark us an IO worker, and block any signal that isn't
-		 * fatal or STOP
-		 */
-		p->flags |= PF_IO_WORKER;
-		siginitsetinv(&p->blocked, sigmask(SIGKILL)|sigmask(SIGSTOP));
-	}
 
 	cpufreq_task_times_init(p);
 
@@ -2139,9 +2188,14 @@ static __latent_entropy struct task_struct *copy_process(
 		goto bad_fork_cleanup_perf;
 	/* copy all the process information */
 	shm_init_task(p);
-	retval = security_task_alloc(p, clone_flags);
+	retval = dup_task_integrity(clone_flags, p);
 	if (retval)
 		goto bad_fork_cleanup_audit;
+	retval = security_task_alloc(p, clone_flags);
+	if (retval) {
+		task_integrity_cleanup(p);
+		goto bad_fork_cleanup_audit;
+	}
 	retval = copy_semundo(clone_flags, p);
 	if (retval)
 		goto bad_fork_cleanup_security;
@@ -2246,7 +2300,6 @@ static __latent_entropy struct task_struct *copy_process(
 	p->pdeath_signal = 0;
 	INIT_LIST_HEAD(&p->thread_group);
 	p->task_works = NULL;
-	clear_posix_cputimers_work(p);
 
 	/*
 	 * Ensure that the cgroup subsystem policies allow the new process to be
@@ -2257,17 +2310,6 @@ static __latent_entropy struct task_struct *copy_process(
 	retval = cgroup_can_fork(p, args);
 	if (retval)
 		goto bad_fork_put_pidfd;
-
-	/*
-	 * Now that the cgroups are pinned, re-clone the parent cgroup and put
-	 * the new task on the correct runqueue. All this *before* the task
-	 * becomes visible.
-	 *
-	 * This isn't part of ->can_fork() because while the re-cloning is
-	 * cgroup specific, it unconditionally needs to place the task on a
-	 * runqueue.
-	 */
-	sched_cgroup_fork(p, args);
 
 	/*
 	 * From this point on we must avoid any synchronous user-space
@@ -2324,6 +2366,14 @@ static __latent_entropy struct task_struct *copy_process(
 		goto bad_fork_cancel_cgroup;
 	}
 
+	retval = task_integrity_apply(clone_flags, p);
+	if (retval)
+		goto bad_fork_cancel_cgroup;
+
+	/* past the last point of failure */
+	if (pidfile)
+		fd_install(pidfd, pidfile);
+
 	init_task_pid_links(p);
 	if (likely(p->pid)) {
 		ptrace_init_task(p, (clone_flags & CLONE_PTRACE) || trace);
@@ -2372,9 +2422,6 @@ static __latent_entropy struct task_struct *copy_process(
 	syscall_tracepoint_update(p);
 	write_unlock_irq(&tasklist_lock);
 
-	if (pidfile)
-		fd_install(pidfd, pidfile);
-
 	proc_fork_connector(p);
 	sched_post_fork(p);
 	cgroup_post_fork(p, args);
@@ -2385,6 +2432,10 @@ static __latent_entropy struct task_struct *copy_process(
 
 	copy_oom_score_adj(clone_flags, p);
 
+#ifdef CONFIG_KDP_CRED
+	if (kdp_enable)
+		kdp_assign_pgd(p);
+#endif
 	return p;
 
 bad_fork_cancel_cgroup:
@@ -2481,28 +2532,6 @@ struct mm_struct *copy_init_mm(void)
 }
 
 /*
- * This is like kernel_clone(), but shaved down and tailored to just
- * creating io_uring workers. It returns a created task, or an error pointer.
- * The returned task is inactive, and the caller must fire it up through
- * wake_up_new_task(p). All signals are blocked in the created task.
- */
-struct task_struct *create_io_thread(int (*fn)(void *), void *arg, int node)
-{
-	unsigned long flags = CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|
-				CLONE_IO;
-	struct kernel_clone_args args = {
-		.flags		= ((lower_32_bits(flags) | CLONE_VM |
-				    CLONE_UNTRACED) & ~CSIGNAL),
-		.exit_signal	= (lower_32_bits(flags) & CSIGNAL),
-		.stack		= (unsigned long)fn,
-		.stack_size	= (unsigned long)arg,
-		.io_thread	= 1,
-	};
-
-	return copy_process(NULL, 0, node, &args);
-}
-
-/*
  *  Ok, this is the main fork-routine.
  *
  * It copies the process, and if successful kick-starts
@@ -2567,6 +2596,10 @@ pid_t kernel_clone(struct kernel_clone_args *args)
 
 	pid = get_task_pid(p, PIDTYPE_PID);
 	nr = pid_vnr(pid);
+
+#ifdef CONFIG_SECURITY_DEFEX
+	task_defex_zero_creds(p);
+#endif
 
 	if (clone_flags & CLONE_PARENT_SETTID)
 		put_user(nr, args->parent_tid);

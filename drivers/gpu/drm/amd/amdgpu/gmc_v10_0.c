@@ -973,7 +973,12 @@ static int gmc_v10_0_gart_enable(struct amdgpu_device *adev)
 	gmc_v10_0_flush_gpu_tlb(adev, 0, AMDGPU_MMHUB_0, 0);
 	gmc_v10_0_flush_gpu_tlb(adev, 0, AMDGPU_GFXHUB_0, 0);
 
-	DRM_INFO("PCIE GART of %uM enabled (table at 0x%016llX).\n",
+	if (amdgpu_force_gtt)
+		DRM_INFO("SGPU GART of %uM enabled (table at 0x%016llX).\n",
+		 (unsigned)(adev->gart.table_size),
+		 (unsigned long long)adev->csm_gart_paddr);
+	else
+		DRM_INFO("PCIE GART of %uM enabled (table at 0x%016llX).\n",
 		 (unsigned)(adev->gmc.gart_size >> 20),
 		 (unsigned long long)amdgpu_bo_gpu_offset(adev->gart.bo));
 
@@ -1018,8 +1023,6 @@ static int gmc_v10_0_hw_fini(void *handle)
 {
 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 
-	gmc_v10_0_gart_disable(adev);
-
 	if (amdgpu_sriov_vf(adev)) {
 		/* full access mode, so don't touch any GMC register */
 		DRM_DEBUG("For SRIOV client, shouldn't do anything.\n");
@@ -1028,6 +1031,7 @@ static int gmc_v10_0_hw_fini(void *handle)
 
 	amdgpu_irq_put(adev, &adev->gmc.ecc_irq, 0);
 	amdgpu_irq_put(adev, &adev->gmc.vm_fault, 0);
+	gmc_v10_0_gart_disable(adev);
 
 	return 0;
 }

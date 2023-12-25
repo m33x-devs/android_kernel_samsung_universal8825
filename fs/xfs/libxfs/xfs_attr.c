@@ -876,18 +876,21 @@ xfs_attr_node_hasname(
 
 	state = xfs_da_state_alloc(args);
 	if (statep != NULL)
-		*statep = state;
+		*statep = NULL;
 
 	/*
 	 * Search to see if name exists, and get back a pointer to it.
 	 */
 	error = xfs_da3_node_lookup_int(state, &retval);
-	if (error)
-		retval = error;
-
-	if (!statep)
+	if (error) {
 		xfs_da_state_free(state);
+		return error;
+	}
 
+	if (statep != NULL)
+		*statep = state;
+	else
+		xfs_da_state_free(state);
 	return retval;
 }
 

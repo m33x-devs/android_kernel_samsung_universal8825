@@ -18,6 +18,7 @@
 #include <linux/swap.h>
 #include <linux/falloc.h>
 #include <linux/uio.h>
+#include <linux/sched/mm.h>
 #include <linux/fs.h>
 
 static struct page **fuse_pages_alloc(unsigned int npages, gfp_t flags,
@@ -164,7 +165,15 @@ int fuse_do_open(struct fuse_mount *fm, u64 nodeid, struct file *file,
 		}
 	}
 
+	/*
+	 * Ignores FOPEN_DIRECT_IO from the fuse daemon when user does not
+	 * explicitly request direct IO. This is fine since we invalidate the fuse
+	 * page cache when the lower file is updated with passthrough.
+	 */
 	if (isdir)
+		ff->open_flags &= ~FOPEN_DIRECT_IO;
+	else if (fc->passthrough && !(file->f_flags & O_DIRECT) &&
+		 (ff->open_flags & FOPEN_DIRECT_IO))
 		ff->open_flags &= ~FOPEN_DIRECT_IO;
 
 	ff->nodeid = nodeid;
@@ -444,7 +453,7 @@ static void fuse_wait_on_page_writeback(struct inode *inode, pgoff_t index)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
 
-	wait_event(fi->page_waitq, !fuse_page_is_writeback(inode, index));
+	fuse_wait_event(fi->page_waitq, !fuse_page_is_writeback(inode, index));
 }
 
 /*
@@ -1420,7 +1429,6 @@ static int fuse_get_user_pages(struct fuse_args_pages *ap, struct iov_iter *ii,
 			(PAGE_SIZE - ret) & (PAGE_SIZE - 1);
 	}
 
-	ap->args.user_pages = true;
 	if (write)
 		ap->args.in_pages = true;
 	else
@@ -1855,23 +1863,15 @@ int fuse_write_inode(struct inode *inode, struct writeback_control *wbc)
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_file *ff;
 	int err;
-
-	/*
-	 * Inode is always written before the last reference is dropped and
-	 * hence this should not be reached from reclaim.
-	 *
-	 * Writing back the inode from reclaim can deadlock if the request
-	 * processing itself needs an allocation.  Allocations triggering
-	 * reclaim while serving a request can't be prevented, because it can
-	 * involve any number of unrelated userspace processes.
-	 */
-	WARN_ON(wbc->for_reclaim);
+	/* @fs.sec -- E8B3F75DDB82DFE8F52508F039ABE4FF -- */
+	unsigned int nofs_flag = memalloc_nofs_save();
 
 	ff = __fuse_write_file_get(fc, fi);
 	err = fuse_flush_times(inode, ff);
 	if (ff)
 		fuse_file_put(ff, false, false);
 
+	memalloc_nofs_restore(nofs_flag);
 	return err;
 }
 
@@ -3261,7 +3261,7 @@ fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 
 static int fuse_writeback_range(struct inode *inode, loff_t start, loff_t end)
 {
-	int err = filemap_write_and_wait_range(inode->i_mapping, start, LLONG_MAX);
+	int err = filemap_write_and_wait_range(inode->i_mapping, start, -1);
 
 	if (!err)
 		fuse_sync_writes(inode);
@@ -3358,8 +3358,6 @@ out:
 
 	if (lock_inode)
 		inode_unlock(inode);
-
-	fuse_flush_time_update(inode);
 
 	return err;
 }
@@ -3469,8 +3467,6 @@ out:
 
 	inode_unlock(inode_out);
 	file_accessed(file_in);
-
-	fuse_flush_time_update(inode_out);
 
 	return err;
 }

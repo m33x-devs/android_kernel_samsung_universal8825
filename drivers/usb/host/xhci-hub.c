@@ -15,6 +15,10 @@
 #include "xhci.h"
 #include "xhci-trace.h"
 
+#if IS_ENABLED(CONFIG_PHY_EXYNOS_USBDRD_EUSB)
+#define DWC3_GUSB2PHYCFG_EUSB2OPMODE	BIT(14)
+#endif
+
 #define	PORT_WAKE_BITS	(PORT_WKOC_E | PORT_WKDISC_E | PORT_WKCONN_E)
 #define	PORT_RWC_BITS	(PORT_CSC | PORT_PEC | PORT_WRC | PORT_OCC | \
 			 PORT_RC | PORT_PLC | PORT_PE)
@@ -171,6 +175,7 @@ static void xhci_common_hub_descriptor(struct xhci_hcd *xhci,
 {
 	u16 temp;
 
+	desc->bPwrOn2PwrGood = 10;	/* xhci section 5.4.9 says 20ms max */
 	desc->bHubContrCurrent = 0;
 
 	desc->bNbrPorts = ports;
@@ -205,7 +210,6 @@ static void xhci_usb2_hub_descriptor(struct usb_hcd *hcd, struct xhci_hcd *xhci,
 	desc->bDescriptorType = USB_DT_HUB;
 	temp = 1 + (ports / 8);
 	desc->bDescLength = USB_DT_HUB_NONVAR_SIZE + 2 * temp;
-	desc->bPwrOn2PwrGood = 10;	/* xhci section 5.4.8 says 20ms */
 
 	/* The Device Removable bits are reported on a byte granularity.
 	 * If the port doesn't exist within that byte, the bit is set to 0.
@@ -258,7 +262,6 @@ static void xhci_usb3_hub_descriptor(struct usb_hcd *hcd, struct xhci_hcd *xhci,
 	xhci_common_hub_descriptor(xhci, desc, ports);
 	desc->bDescriptorType = USB_DT_SS_HUB;
 	desc->bDescLength = USB_DT_SS_HUB_SIZE;
-	desc->bPwrOn2PwrGood = 50;	/* usb 3.1 may fail if less than 100ms */
 
 	/* header decode latency should be zero for roothubs,
 	 * see section 4.23.5.2.
@@ -571,7 +574,7 @@ struct xhci_hub *xhci_get_rhub(struct usb_hcd *hcd)
  * It will release and re-aquire the lock while calling ACPI
  * method.
  */
-void xhci_set_port_power(struct xhci_hcd *xhci, struct usb_hcd *hcd,
+static void xhci_set_port_power(struct xhci_hcd *xhci, struct usb_hcd *hcd,
 				u16 index, bool on, unsigned long *flags)
 	__must_hold(&xhci->lock)
 {
@@ -606,6 +609,35 @@ void xhci_set_port_power(struct xhci_hcd *xhci, struct usb_hcd *hcd,
 	spin_lock_irqsave(&xhci->lock, *flags);
 }
 
+/*  Temporarily patch to avoid abi check */
+#if IS_ENABLED(CONFIG_PHY_EXYNOS_USBDRD_EUSB)
+static int xhci_dwusb_exynos_test_set(void)
+{
+	void __iomem *sfr_base;
+	u32 reg;
+
+	sfr_base = ioremap(0x10B0C200, 0x4);
+	reg = __raw_readl(sfr_base);
+
+	reg |= DWC3_GUSB2PHYCFG_EUSB2OPMODE;
+	__raw_writel(reg, sfr_base);
+	pr_info("%s: phycfg = 0x%x\n", __func__, reg);
+	iounmap(sfr_base);
+
+	return 0;
+}
+
+int xhci_halt_nohandshake(struct xhci_hcd *xhci)
+{
+	xhci_dbg_trace(xhci, trace_xhci_dbg_init, "// Halt the HC");
+	xhci_quiesce(xhci);
+
+	xhci->xhc_state |= XHCI_STATE_HALTED;
+	xhci->cmd_ring_state = CMD_RING_STATE_STOPPED;
+	return 0;
+}
+#endif
+
 static void xhci_port_set_test_mode(struct xhci_hcd *xhci,
 	u16 test_mode, u16 wIndex)
 {
@@ -617,6 +649,7 @@ static void xhci_port_set_test_mode(struct xhci_hcd *xhci,
 	temp = readl(port->addr + PORTPMSC);
 	temp |= test_mode << PORT_TEST_MODE_SHIFT;
 	writel(temp, port->addr + PORTPMSC);
+
 	xhci->test_mode = test_mode;
 	if (test_mode == USB_TEST_FORCE_ENABLE)
 		xhci_start(xhci);
@@ -636,12 +669,15 @@ static int xhci_enter_test_mode(struct xhci_hcd *xhci,
 			continue;
 
 		retval = xhci_disable_slot(xhci, i);
-		xhci_free_virt_device(xhci, i);
 		if (retval)
 			xhci_err(xhci, "Failed to disable slot %d, %d. Enter test mode anyway\n",
 				 i, retval);
 	}
 	spin_lock_irqsave(&xhci->lock, *flags);
+
+#if IS_ENABLED(CONFIG_PHY_EXYNOS_USBDRD_EUSB)
+	xhci_dwusb_exynos_test_set();
+#else
 	/* Put all ports to the Disable state by clear PP */
 	xhci_dbg(xhci, "Disable all port (PP = 0)\n");
 	/* Power off USB3 ports*/
@@ -650,16 +686,22 @@ static int xhci_enter_test_mode(struct xhci_hcd *xhci,
 	/* Power off USB2 ports*/
 	for (i = 0; i < xhci->usb2_rhub.num_ports; i++)
 		xhci_set_port_power(xhci, xhci->main_hcd, i, false, flags);
+#endif
 	/* Stop the controller */
-	xhci_dbg(xhci, "Stop controller\n");
+	xhci_info(xhci, "Stop controller\n");
+#if IS_ENABLED(CONFIG_PHY_EXYNOS_USBDRD_EUSB)
+	retval = xhci_halt_nohandshake(xhci);
+#else
 	retval = xhci_halt(xhci);
+#endif
 	if (retval)
 		return retval;
+
 	/* Disable runtime PM for test mode */
 	pm_runtime_forbid(xhci_to_hcd(xhci)->self.controller);
 	/* Set PORTPMSC.PTC field to enter selected test mode */
 	/* Port is selected by wIndex. port_id = wIndex + 1 */
-	xhci_dbg(xhci, "Enter Test Mode: %d, Port_id=%d\n",
+	xhci_info(xhci, "Enter Test Mode: %d, Port_id=%d\n",
 					test_mode, wIndex + 1);
 	xhci_port_set_test_mode(xhci, test_mode, wIndex);
 	return retval;
@@ -681,7 +723,7 @@ static int xhci_exit_test_mode(struct xhci_hcd *xhci)
 	}
 	pm_runtime_allow(xhci_to_hcd(xhci)->self.controller);
 	xhci->test_mode = 0;
-	return xhci_reset(xhci, XHCI_RESET_SHORT_USEC);
+	return xhci_reset(xhci);
 }
 
 void xhci_set_link_state(struct xhci_hcd *xhci, struct xhci_port *port,
@@ -1007,9 +1049,6 @@ static void xhci_get_usb2_port_status(struct xhci_port *port, u32 *status,
 		if (link_state == XDEV_U2)
 			*status |= USB_PORT_STAT_L1;
 		if (link_state == XDEV_U0) {
-			if (bus_state->resume_done[portnum])
-				usb_hcd_end_port_resume(&port->rhub->hcd->self,
-							portnum);
 			bus_state->resume_done[portnum] = 0;
 			clear_bit(portnum, &bus_state->resuming_ports);
 			if (bus_state->suspended_ports & (1 << portnum)) {
@@ -1353,7 +1392,7 @@ int xhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
 				}
 				spin_unlock_irqrestore(&xhci->lock, flags);
 				if (!wait_for_completion_timeout(&bus_state->u3exit_done[wIndex],
-								 msecs_to_jiffies(500)))
+								 msecs_to_jiffies(100)))
 					xhci_dbg(xhci, "missing U0 port change event for port %d-%d\n",
 						 hcd->self.busnum, wIndex + 1);
 				spin_lock_irqsave(&xhci->lock, flags);

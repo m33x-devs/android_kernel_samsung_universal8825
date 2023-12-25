@@ -70,6 +70,7 @@ TRACE_EVENT(cros_ec_request_done,
 		  __entry->retval)
 );
 
+
 #endif /* _CROS_EC_TRACE_H_ */
 
 /* this part must be outside header guard */

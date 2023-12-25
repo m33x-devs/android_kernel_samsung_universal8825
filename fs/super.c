@@ -40,6 +40,9 @@
 #include <uapi/linux/mount.h>
 #include "internal.h"
 
+/* @fs.sec -- 89e449513e5bea6196d9aaf62a6936ae -- */
+void (*ufs_debug_func)(void *) = NULL;
+
 static int thaw_super_locked(struct super_block *sb);
 
 static LIST_HEAD(super_blocks);
@@ -964,8 +967,14 @@ int reconfigure_super(struct fs_context *fc)
 		}
 	}
 
+#ifdef CONFIG_FIVE
+	WRITE_ONCE(sb->s_flags, ((sb->s_flags & ~fc->sb_flags_mask) |
+				 (fc->sb_flags & fc->sb_flags_mask) |
+				 MS_I_VERSION));
+#else
 	WRITE_ONCE(sb->s_flags, ((sb->s_flags & ~fc->sb_flags_mask) |
 				 (fc->sb_flags & fc->sb_flags_mask)));
+#endif
 	/* Needs to be ordered wrt mnt_is_readonly() */
 	smp_wmb();
 	sb->s_readonly_remount = 0;
@@ -1435,7 +1444,7 @@ error_bdev:
 error:
 	return ERR_PTR(error);
 }
-EXPORT_SYMBOL_NS(mount_bdev, ANDROID_GKI_VFS_EXPORT_ONLY);
+EXPORT_SYMBOL(mount_bdev);
 
 void kill_block_super(struct super_block *sb)
 {
@@ -1449,7 +1458,7 @@ void kill_block_super(struct super_block *sb)
 	blkdev_put(bdev, mode | FMODE_EXCL);
 }
 
-EXPORT_SYMBOL_NS(kill_block_super, ANDROID_GKI_VFS_EXPORT_ONLY);
+EXPORT_SYMBOL(kill_block_super);
 #endif
 
 struct dentry *mount_nodev(struct file_system_type *fs_type,
@@ -1472,8 +1481,8 @@ struct dentry *mount_nodev(struct file_system_type *fs_type,
 }
 EXPORT_SYMBOL(mount_nodev);
 
-int reconfigure_single(struct super_block *s,
-		       int flags, void *data)
+static int reconfigure_single(struct super_block *s,
+			      int flags, void *data)
 {
 	struct fs_context *fc;
 	int ret;
@@ -1667,9 +1676,11 @@ static void lockdep_sb_freeze_acquire(struct super_block *sb)
 		percpu_rwsem_acquire(sb->s_writers.rw_sem + level, 0, _THIS_IP_);
 }
 
-static void sb_freeze_unlock(struct super_block *sb, int level)
+static void sb_freeze_unlock(struct super_block *sb)
 {
-	for (level--; level >= 0; level--)
+	int level;
+
+	for (level = SB_FREEZE_LEVELS - 1; level >= 0; level--)
 		percpu_up_write(sb->s_writers.rw_sem + level);
 }
 
@@ -1740,14 +1751,7 @@ int freeze_super(struct super_block *sb)
 	sb_wait_write(sb, SB_FREEZE_PAGEFAULT);
 
 	/* All writers are done so after syncing there won't be dirty data */
-	ret = sync_filesystem(sb);
-	if (ret) {
-		sb->s_writers.frozen = SB_UNFROZEN;
-		sb_freeze_unlock(sb, SB_FREEZE_PAGEFAULT);
-		wake_up(&sb->s_writers.wait_unfrozen);
-		deactivate_locked_super(sb);
-		return ret;
-	}
+	sync_filesystem(sb);
 
 	/* Now wait for internal filesystem counter */
 	sb->s_writers.frozen = SB_FREEZE_FS;
@@ -1759,7 +1763,7 @@ int freeze_super(struct super_block *sb)
 			printk(KERN_ERR
 				"VFS:Filesystem freeze failed\n");
 			sb->s_writers.frozen = SB_UNFROZEN;
-			sb_freeze_unlock(sb, SB_FREEZE_FS);
+			sb_freeze_unlock(sb);
 			wake_up(&sb->s_writers.wait_unfrozen);
 			deactivate_locked_super(sb);
 			return ret;
@@ -1810,7 +1814,7 @@ static int thaw_super_locked(struct super_block *sb)
 	}
 
 	sb->s_writers.frozen = SB_UNFROZEN;
-	sb_freeze_unlock(sb, SB_FREEZE_FS);
+	sb_freeze_unlock(sb);
 out:
 	wake_up(&sb->s_writers.wait_unfrozen);
 	deactivate_locked_super(sb);

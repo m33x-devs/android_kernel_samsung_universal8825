@@ -20,8 +20,10 @@
 #include <asm/switch_to.h>
 #include <asm/tlb.h>
 
+#include <linux/sec_debug.h>
+
 #include "../workqueue_internal.h"
-#include "../../io_uring/io-wq.h"
+#include "../../fs/io-wq.h"
 #include "../smpboot.h"
 
 #include "pelt.h"
@@ -39,7 +41,6 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(pelt_rt_tp);
 EXPORT_TRACEPOINT_SYMBOL_GPL(pelt_dl_tp);
 EXPORT_TRACEPOINT_SYMBOL_GPL(pelt_irq_tp);
 EXPORT_TRACEPOINT_SYMBOL_GPL(pelt_se_tp);
-EXPORT_TRACEPOINT_SYMBOL_GPL(pelt_thermal_tp);
 EXPORT_TRACEPOINT_SYMBOL_GPL(sched_cpu_capacity_tp);
 EXPORT_TRACEPOINT_SYMBOL_GPL(sched_overutilized_tp);
 EXPORT_TRACEPOINT_SYMBOL_GPL(sched_util_est_cfs_tp);
@@ -1606,7 +1607,7 @@ static void __init init_uclamp_rq(struct rq *rq)
 		};
 	}
 
-	rq->uclamp_flags = UCLAMP_FLAG_IDLE;
+	rq->uclamp_flags = 0;
 }
 
 static void __init init_uclamp(void)
@@ -2996,6 +2997,8 @@ static void ttwu_queue(struct task_struct *p, int cpu, int wake_flags)
  * accesses to the task state; see try_to_wake_up() and set_current_state().
  */
 
+extern bool freezing_32bit_capable_cpus;
+
 /**
  * try_to_wake_up - wake up a thread
  * @p: the thread to be awakened
@@ -3085,6 +3088,10 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 	    !cpumask_intersects(cpu_active_mask, task_cpu_possible_mask(p)))
 		goto unlock;
 #endif
+
+	if (unlikely(freezing_32bit_capable_cpus) &&
+	    task_cpu_possible_mask(p) != cpu_possible_mask)
+		goto unlock;
 
 	trace_sched_waking(p);
 
@@ -3455,6 +3462,8 @@ static inline void init_schedstats(void) {}
  */
 int sched_fork(unsigned long clone_flags, struct task_struct *p)
 {
+	unsigned long flags;
+
 	trace_android_rvh_sched_fork(p);
 
 	__sched_fork(clone_flags, p);
@@ -3504,6 +3513,23 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 	init_entity_runnable_average(&p->se);
 	trace_android_rvh_finish_prio_fork(p);
 
+	/*
+	 * The child is not yet in the pid-hash so no cgroup attach races,
+	 * and the cgroup is pinned to this child due to cgroup_fork()
+	 * is ran before sched_fork().
+	 *
+	 * Silence PROVE_RCU.
+	 */
+	raw_spin_lock_irqsave(&p->pi_lock, flags);
+	rseq_migrate(p);
+	/*
+	 * We're setting the CPU for the first time, we don't migrate,
+	 * so use __set_task_cpu().
+	 */
+	__set_task_cpu(p, smp_processor_id());
+	if (p->sched_class->task_fork)
+		p->sched_class->task_fork(p);
+	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
 
 #ifdef CONFIG_SCHED_INFO
 	if (likely(sched_info_on()))
@@ -3518,36 +3544,6 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 	RB_CLEAR_NODE(&p->pushable_dl_tasks);
 #endif
 	return 0;
-}
-
-void sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs)
-{
-	unsigned long flags;
-
-	/*
-	 * Because we're not yet on the pid-hash, p->pi_lock isn't strictly
-	 * required yet, but lockdep gets upset if rules are violated.
-	 */
-	raw_spin_lock_irqsave(&p->pi_lock, flags);
-#ifdef CONFIG_CGROUP_SCHED
-	if (1) {
-		struct task_group *tg;
-
-		tg = container_of(kargs->cset->subsys[cpu_cgrp_id],
-				  struct task_group, css);
-		tg = autogroup_task_group(p, tg);
-		p->sched_task_group = tg;
-	}
-#endif
-	rseq_migrate(p);
-	/*
-	 * We're setting the CPU for the first time, we don't migrate,
-	 * so use __set_task_cpu().
-	 */
-	__set_task_cpu(p, smp_processor_id());
-	if (p->sched_class->task_fork)
-		p->sched_class->task_fork(p);
-	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
 }
 
 void sched_post_fork(struct task_struct *p)
@@ -4510,7 +4506,7 @@ static noinline void __schedule_bug(struct task_struct *prev)
 	if (oops_in_progress)
 		return;
 
-	printk(KERN_ERR "BUG: scheduling while atomic: %s/%d/0x%08x\n",
+	pr_auto(ASL6, "BUG: scheduling while atomic: %s/%d/0x%08x\n",
 		prev->comm, prev->pid, preempt_count());
 
 	debug_show_held_locks(prev);
@@ -4630,6 +4626,23 @@ restart:
 	BUG();
 }
 
+static bool __task_can_run(struct task_struct *prev)
+{
+	if (unlikely(__fatal_signal_pending(prev)))
+		return true;
+
+	if (unlikely(!frozen_or_skipped(prev)))
+		return true;
+
+	/*
+	 * We can't safely go back on the runqueue if we're an asymmetric
+	 * task skipping the freezer. Doing so can lead to migration failures
+	 * later on if there are not suitable CPUs left around for us to
+	 * go to.
+	 */
+	return task_cpu_possible_mask(prev) == cpu_possible_mask;
+}
+
 /*
  * __schedule() is the main scheduler function.
  *
@@ -4723,7 +4736,7 @@ static void __sched notrace __schedule(bool preempt)
 	 */
 	prev_state = prev->state;
 	if (!preempt && prev_state) {
-		if (signal_pending_state(prev_state, prev)) {
+		if (signal_pending_state(prev_state, prev) && __task_can_run(prev)) {
 			prev->state = TASK_RUNNING;
 		} else {
 			prev->sched_contributes_to_load =
@@ -6715,6 +6728,37 @@ void sched_show_task(struct task_struct *p)
 }
 EXPORT_SYMBOL_GPL(sched_show_task);
 
+#ifdef CONFIG_SEC_DEBUG_AUTO_COMMENT
+void sched_show_task_auto_comment(struct task_struct *p)
+{
+	unsigned long free = 0;
+	int ppid;
+
+	if (!try_get_task_stack(p))
+		return;
+
+	pr_auto(ASL1, "task:%-15.15s state:%c", p->comm, task_state_to_char(p));
+
+	if (p->state == TASK_RUNNING)
+		pr_cont("  running task    ");
+#ifdef CONFIG_DEBUG_STACK_USAGE
+	free = stack_not_used(p);
+#endif
+	ppid = 0;
+	rcu_read_lock();
+	if (pid_alive(p))
+		ppid = task_pid_nr(rcu_dereference(p->real_parent));
+	rcu_read_unlock();
+	pr_cont(" stack:%5lu pid:%5d ppid:%6d flags:0x%08lx\n",
+		free, task_pid_nr(p), ppid,
+		(unsigned long)task_thread_info(p)->flags);
+
+	print_worker_info(KERN_INFO, p);
+	show_stack_auto_comment(p, NULL);
+	put_task_stack(p);
+}
+#endif /* CONFIG_SEC_DEBUG_AUTO_COMMENT */
+
 static inline bool
 state_filter_match(unsigned long state_filter, struct task_struct *p)
 {
@@ -7661,7 +7705,7 @@ void ___might_sleep(const char *file, int line, int preempt_offset)
 	/* Save this before calling printk(), since that will clobber it: */
 	preempt_disable_ip = get_preempt_disable_ip(current);
 
-	printk(KERN_ERR
+	pr_auto(ASL6,
 		"BUG: sleeping function called from invalid context at %s:%d\n",
 			file, line);
 	printk(KERN_ERR

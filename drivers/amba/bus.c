@@ -374,6 +374,9 @@ static int amba_device_try_add(struct amba_device *dev, struct resource *parent)
 	void __iomem *tmp;
 	int i, ret;
 
+	WARN_ON(dev->irq[0] == (unsigned int)-1);
+	WARN_ON(dev->irq[1] == (unsigned int)-1);
+
 	ret = request_resource(parent, &dev->res);
 	if (ret)
 		goto err_out;
@@ -503,7 +506,7 @@ static DEFINE_MUTEX(deferred_devices_lock);
 static void amba_deferred_retry_func(struct work_struct *dummy);
 static DECLARE_DELAYED_WORK(deferred_retry_work, amba_deferred_retry_func);
 
-#define DEFERRED_DEVICE_TIMEOUT (msecs_to_jiffies(5 * 1000))
+#define DEFERRED_DEVICE_TIMEOUT (msecs_to_jiffies(1 * 1000))
 
 static int amba_deferred_retry(void)
 {

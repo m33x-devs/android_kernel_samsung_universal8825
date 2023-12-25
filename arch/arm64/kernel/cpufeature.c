@@ -86,6 +86,7 @@
 #include <asm/traps.h>
 #include <asm/vectors.h>
 #include <asm/virt.h>
+#include <linux/wakeup_reason.h>
 
 /* Kernel representation of AT_HWCAP and AT_HWCAP2 */
 static unsigned long elf_hwcap __read_mostly;
@@ -581,19 +582,15 @@ static const struct arm64_ftr_bits ftr_raz[] = {
 	ARM64_FTR_END,
 };
 
-#define __ARM64_FTR_REG_OVERRIDE(id_str, id, table, ovr) {	\
+#define ARM64_FTR_REG_OVERRIDE(id, table, ovr) {		\
 		.sys_id = id,					\
 		.reg = 	&(struct arm64_ftr_reg){		\
-			.name = id_str,				\
+			.name = #id,				\
 			.override = (ovr),			\
 			.ftr_bits = &((table)[0]),		\
 	}}
 
-#define ARM64_FTR_REG_OVERRIDE(id, table, ovr)	\
-	__ARM64_FTR_REG_OVERRIDE(#id, id, table, ovr)
-
-#define ARM64_FTR_REG(id, table)		\
-	__ARM64_FTR_REG_OVERRIDE(#id, id, table, &no_override)
+#define ARM64_FTR_REG(id, table) ARM64_FTR_REG_OVERRIDE(id, table, &no_override)
 
 struct arm64_ftr_override __ro_after_init id_aa64mmfr1_override;
 struct arm64_ftr_override __ro_after_init id_aa64pfr1_override;
@@ -1626,9 +1623,6 @@ static bool cpu_has_broken_dbm(void)
 		MIDR_ALL_VERSIONS(MIDR_CORTEX_A55),
 		/* Kryo4xx Silver (rdpe => r1p0) */
 		MIDR_REV(MIDR_QCOM_KRYO_4XX_SILVER, 0xd, 0xe),
-#endif
-#ifdef CONFIG_ARM64_ERRATUM_2051678
-		MIDR_REV_RANGE(MIDR_CORTEX_A510, 0, 0, 2),
 #endif
 		{},
 	};
@@ -2971,6 +2965,24 @@ static int enable_mismatched_32bit_el0(unsigned int cpu)
 	return 0;
 }
 
+int sched_check_cfs_rq_32bit(int cpu);
+static int check_remained_32bit_el0_task(unsigned int cpu)
+{
+	int ret;
+
+	if (cpumask_intersects(cpu_active_mask, system_32bit_el0_cpumask()))
+		return 0;
+
+	/* Run here if all 32bit capable cpus are inactive */
+	ret = sched_check_cfs_rq_32bit(cpu);
+	if (ret) {
+		pr_warn("32bit task is still running but there is no 32bit capable cpu\n");
+		log_suspend_abort_reason("32bit task abort disabling cpu");
+	}
+
+	return ret;
+}
+
 static int __init init_32bit_el0_mask(void)
 {
 	if (!allow_mismatched_32bit_el0)
@@ -2981,7 +2993,7 @@ static int __init init_32bit_el0_mask(void)
 
 	return cpuhp_setup_state(CPUHP_AP_ONLINE_DYN,
 				 "arm64/mismatched_32bit_el0:online",
-				 enable_mismatched_32bit_el0, NULL);
+				 enable_mismatched_32bit_el0, check_remained_32bit_el0_task);
 }
 subsys_initcall_sync(init_32bit_el0_mask);
 

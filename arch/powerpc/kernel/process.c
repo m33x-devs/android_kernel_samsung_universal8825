@@ -1684,7 +1684,7 @@ int copy_thread(unsigned long clone_flags, unsigned long usp,
 	/* Copy registers */
 	sp -= sizeof(struct pt_regs);
 	childregs = (struct pt_regs *) sp;
-	if (unlikely(p->flags & (PF_KTHREAD | PF_IO_WORKER))) {
+	if (unlikely(p->flags & PF_KTHREAD)) {
 		/* kernel thread */
 		memset(childregs, 0, sizeof(struct pt_regs));
 		childregs->gpr[1] = sp + sizeof(struct pt_regs);
@@ -1800,7 +1800,7 @@ void start_thread(struct pt_regs *regs, unsigned long start, unsigned long sp)
 		tm_reclaim_current(0);
 #endif
 
-	memset(&regs->gpr[1], 0, sizeof(regs->gpr) - sizeof(regs->gpr[0]));
+	memset(regs->gpr, 0, sizeof(regs->gpr));
 	regs->ctr = 0;
 	regs->link = 0;
 	regs->xer = 0;
@@ -2108,12 +2108,12 @@ static unsigned long __get_wchan(struct task_struct *p)
 		return 0;
 
 	do {
-		sp = READ_ONCE_NOCHECK(*(unsigned long *)sp);
+		sp = *(unsigned long *)sp;
 		if (!validate_sp(sp, p, STACK_FRAME_OVERHEAD) ||
 		    p->state == TASK_RUNNING)
 			return 0;
 		if (count > 0) {
-			ip = READ_ONCE_NOCHECK(((unsigned long *)sp)[STACK_FRAME_LR_SAVE]);
+			ip = ((unsigned long *)sp)[STACK_FRAME_LR_SAVE];
 			if (!in_sched_functions(ip))
 				return ip;
 		}

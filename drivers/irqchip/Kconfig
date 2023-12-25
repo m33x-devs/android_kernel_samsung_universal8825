@@ -426,7 +426,6 @@ config MESON_IRQ_GPIO
 config GOLDFISH_PIC
        bool "Goldfish programmable interrupt controller"
        depends on MIPS && (GOLDFISH || COMPILE_TEST)
-       select GENERIC_IRQ_CHIP
        select IRQ_DOMAIN
        help
          Say yes here to enable Goldfish interrupt controller driver used
@@ -599,5 +598,9 @@ config MST_IRQ
 	select IRQ_DOMAIN_HIERARCHY
 	help
 	  Support MStar Interrupt Controller.
+
+config ARM_GIC_V3_VENDORHOOK
+	tristate "Vendor hook for ARM GIC V3"
+	depends on ARM_GIC_V3
 
 endmenu

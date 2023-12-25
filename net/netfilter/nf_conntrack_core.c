@@ -53,8 +53,14 @@
 #include <net/netfilter/nf_nat_helper.h>
 #include <net/netns/hash.h>
 #include <net/ip.h>
+// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+#include <net/ncm.h>
+#endif
+// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
 
 #include "nf_internals.h"
+#include <linux/time.h>
 
 __cacheline_aligned_in_smp spinlock_t nf_conntrack_locks[CONNTRACK_LOCKS];
 EXPORT_SYMBOL_GPL(nf_conntrack_locks);
@@ -75,9 +81,6 @@ struct conntrack_gc_work {
 static __read_mostly struct kmem_cache *nf_conntrack_cachep;
 static DEFINE_SPINLOCK(nf_conntrack_locks_all_lock);
 static __read_mostly bool nf_conntrack_locks_all;
-
-/* serialize hash resizes and nf_ct_iterate_cleanup */
-static DEFINE_MUTEX(nf_conntrack_mutex);
 
 #define GC_SCAN_INTERVAL	(120u * HZ)
 #define GC_SCAN_MAX_DURATION	msecs_to_jiffies(10)
@@ -497,6 +500,14 @@ static void nf_ct_add_to_dying_list(struct nf_conn *ct)
 {
 	struct ct_pcpu *pcpu;
 
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+	if ( (check_ncm_flag()) && (ct != NULL) && (NF_CONN_NPA_VENDOR_DATA_GET(ct)) && (atomic_read(&NF_CONN_NPA_VENDOR_DATA_GET(ct)->startFlow)) ) {
+		knox_collect_conntrack_data(ct, NCM_FLOW_TYPE_CLOSE, 10);
+	}
+#endif
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
+
 	/* add this conntrack to the (per cpu) dying list */
 	ct->cpu = smp_processor_id();
 	pcpu = per_cpu_ptr(nf_ct_net(ct)->ct.pcpu_lists, ct->cpu);
@@ -597,6 +608,15 @@ destroy_conntrack(struct nf_conntrack *nfct)
 {
 	struct nf_conn *ct = (struct nf_conn *)nfct;
 
+    // SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+	if (NF_CONN_NPA_VENDOR_DATA_GET(ct)) {
+		kfree(NF_CONN_NPA_VENDOR_DATA_GET(ct));
+		ct->android_oem_data1 = (u64)NULL;
+	}
+#endif
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
+
 	pr_debug("destroy_conntrack(%p)\n", ct);
 	WARN_ON(atomic_read(&nfct->use) != 0);
 
@@ -661,7 +681,7 @@ bool nf_ct_delete(struct nf_conn *ct, u32 portid, int report)
 
 	tstamp = nf_conn_tstamp_find(ct);
 	if (tstamp) {
-		s32 timeout = READ_ONCE(ct->timeout) - nfct_time_stamp;
+		s32 timeout = ct->timeout - nfct_time_stamp;
 
 		tstamp->stop = ktime_get_real_ns();
 		if (timeout < 0)
@@ -981,7 +1001,7 @@ static int nf_ct_resolve_clash_harder(struct sk_buff *skb, u32 repl_idx)
 	}
 
 	/* We want the clashing entry to go away real soon: 1 second timeout. */
-	WRITE_ONCE(loser_ct->timeout, nfct_time_stamp + HZ);
+	loser_ct->timeout = nfct_time_stamp + HZ;
 
 	/* IPS_NAT_CLASH removes the entry automatically on the first
 	 * reply.  Also prevents UDP tracker from moving the entry to
@@ -1388,6 +1408,16 @@ static void gc_worker(struct work_struct *work)
 			if (nf_ct_is_expired(tmp)) {
 				nf_ct_gc_expired(tmp);
 				continue;
+			// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+			} else if ( (tmp != NULL) && (check_ncm_flag()) && (check_intermediate_flag()) && (NF_CONN_NPA_VENDOR_DATA_GET(tmp)) && (atomic_read(&NF_CONN_NPA_VENDOR_DATA_GET(tmp)->startFlow)) && (atomic_read(&NF_CONN_NPA_VENDOR_DATA_GET(tmp)->intermediateFlow)) ) {
+				s32 npa_timeout = NF_CONN_NPA_VENDOR_DATA_GET(tmp)->npa_timeout - ((u32)(jiffies));
+				if (npa_timeout <= 0) {
+					NF_CONN_NPA_VENDOR_DATA_GET(tmp)->npa_timeout = ((u32)(jiffies)) + (get_intermediate_timeout() * HZ);
+					knox_collect_conntrack_data(tmp, NCM_FLOW_TYPE_INTERMEDIATE, 20);
+			}
+#endif
+			// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
 			}
 
 			if (nf_conntrack_max95 == 0 || gc_worker_skip_ct(tmp))
@@ -1458,6 +1488,11 @@ __nf_conntrack_alloc(struct net *net,
 		     gfp_t gfp, u32 hash)
 {
 	struct nf_conn *ct;
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+	struct timespec64 open_timespec;
+#endif
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
 
 	/* We don't want any race condition at early drop stage */
 	atomic_inc(&net->ct.count);
@@ -1482,19 +1517,35 @@ __nf_conntrack_alloc(struct net *net,
 		goto out;
 
 	spin_lock_init(&ct->lock);
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+	ct->android_oem_data1 = (u64)NULL;
+#endif
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
 	ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple = *orig;
 	ct->tuplehash[IP_CT_DIR_ORIGINAL].hnnode.pprev = NULL;
 	ct->tuplehash[IP_CT_DIR_REPLY].tuple = *repl;
 	/* save hash for reusing when confirming */
 	*(unsigned long *)(&ct->tuplehash[IP_CT_DIR_REPLY].hnnode.pprev) = hash;
 	ct->status = 0;
-	WRITE_ONCE(ct->timeout, 0);
+	ct->timeout = 0;
 	write_pnet(&ct->ct_net, net);
 	memset(&ct->__nfct_init_offset, 0,
 	       offsetof(struct nf_conn, proto) -
 	       offsetof(struct nf_conn, __nfct_init_offset));
 
 	nf_ct_zone_add(ct, zone);
+
+	trace_android_rvh_nf_conn_alloc(ct);
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+	ct->android_oem_data1 = (u64)kzalloc(sizeof(struct nf_conn_npa_vendor_data), gfp);
+	ktime_get_ts64(&open_timespec);
+	if (NF_CONN_NPA_VENDOR_DATA_GET(ct) != NULL){
+		NF_CONN_NPA_VENDOR_DATA_GET(ct)->open_time = open_timespec.tv_sec;
+	}
+#endif
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
 
 	/* Because we use RCU lookups, we set ct_general.use to zero before
 	 * this is inserted in any list.
@@ -1528,6 +1579,15 @@ void nf_conntrack_free(struct nf_conn *ct)
 	nf_ct_ext_destroy(ct);
 	kmem_cache_free(nf_conntrack_cachep, ct);
 	smp_mb__before_atomic();
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+	if (NF_CONN_NPA_VENDOR_DATA_GET(ct)) {
+		kfree(NF_CONN_NPA_VENDOR_DATA_GET(ct));
+		ct->android_oem_data1 = (u64)NULL;
+	}
+#endif
+	// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
+	trace_android_rvh_nf_conn_free(ct);
 	atomic_dec(&net->ct.count);
 }
 EXPORT_SYMBOL_GPL(nf_conntrack_free);
@@ -1833,17 +1893,15 @@ repeat:
 		pr_debug("nf_conntrack_in: Can't track with proto module\n");
 		nf_conntrack_put(&ct->ct_general);
 		skb->_nfct = 0;
+		NF_CT_STAT_INC_ATOMIC(state->net, invalid);
+		if (ret == -NF_DROP)
+			NF_CT_STAT_INC_ATOMIC(state->net, drop);
 		/* Special case: TCP tracker reports an attempt to reopen a
 		 * closed/aborted connection. We have to go back and create a
 		 * fresh conntrack.
 		 */
 		if (ret == -NF_REPEAT)
 			goto repeat;
-
-		NF_CT_STAT_INC_ATOMIC(state->net, invalid);
-		if (ret == -NF_DROP)
-			NF_CT_STAT_INC_ATOMIC(state->net, drop);
-
 		ret = -ret;
 		goto out;
 	}
@@ -2179,31 +2237,28 @@ get_next_corpse(int (*iter)(struct nf_conn *i, void *data),
 	spinlock_t *lockp;
 
 	for (; *bucket < nf_conntrack_htable_size; (*bucket)++) {
-		struct hlist_nulls_head *hslot = &nf_conntrack_hash[*bucket];
-
-		if (hlist_nulls_empty(hslot))
-			continue;
-
 		lockp = &nf_conntrack_locks[*bucket % CONNTRACK_LOCKS];
 		local_bh_disable();
 		nf_conntrack_lock(lockp);
-		hlist_nulls_for_each_entry(h, n, hslot, hnnode) {
-			if (NF_CT_DIRECTION(h) != IP_CT_DIR_REPLY)
-				continue;
-			/* All nf_conn objects are added to hash table twice, one
-			 * for original direction tuple, once for the reply tuple.
-			 *
-			 * Exception: In the IPS_NAT_CLASH case, only the reply
-			 * tuple is added (the original tuple already existed for
-			 * a different object).
-			 *
-			 * We only need to call the iterator once for each
-			 * conntrack, so we just use the 'reply' direction
-			 * tuple while iterating.
-			 */
-			ct = nf_ct_tuplehash_to_ctrack(h);
-			if (iter(ct, data))
-				goto found;
+		if (*bucket < nf_conntrack_htable_size) {
+			hlist_nulls_for_each_entry(h, n, &nf_conntrack_hash[*bucket], hnnode) {
+				if (NF_CT_DIRECTION(h) != IP_CT_DIR_REPLY)
+					continue;
+				/* All nf_conn objects are added to hash table twice, one
+				 * for original direction tuple, once for the reply tuple.
+				 *
+				 * Exception: In the IPS_NAT_CLASH case, only the reply
+				 * tuple is added (the original tuple already existed for
+				 * a different object).
+				 *
+				 * We only need to call the iterator once for each
+				 * conntrack, so we just use the 'reply' direction
+				 * tuple while iterating.
+				 */
+				ct = nf_ct_tuplehash_to_ctrack(h);
+				if (iter(ct, data))
+					goto found;
+			}
 		}
 		spin_unlock(lockp);
 		local_bh_enable();
@@ -2221,20 +2276,26 @@ found:
 static void nf_ct_iterate_cleanup(int (*iter)(struct nf_conn *i, void *data),
 				  void *data, u32 portid, int report)
 {
-	unsigned int bucket = 0;
+	unsigned int bucket = 0, sequence;
 	struct nf_conn *ct;
 
 	might_sleep();
 
-	mutex_lock(&nf_conntrack_mutex);
-	while ((ct = get_next_corpse(iter, data, &bucket)) != NULL) {
-		/* Time to push up daises... */
+	for (;;) {
+		sequence = read_seqcount_begin(&nf_conntrack_generation);
 
-		nf_ct_delete(ct, portid, report);
-		nf_ct_put(ct);
-		cond_resched();
+		while ((ct = get_next_corpse(iter, data, &bucket)) != NULL) {
+			/* Time to push up daises... */
+
+			nf_ct_delete(ct, portid, report);
+			nf_ct_put(ct);
+			cond_resched();
+		}
+
+		if (!read_seqcount_retry(&nf_conntrack_generation, sequence))
+			break;
+		bucket = 0;
 	}
-	mutex_unlock(&nf_conntrack_mutex);
 }
 
 struct iter_data {
@@ -2464,10 +2525,8 @@ int nf_conntrack_hash_resize(unsigned int hashsize)
 	if (!hash)
 		return -ENOMEM;
 
-	mutex_lock(&nf_conntrack_mutex);
 	old_size = nf_conntrack_htable_size;
 	if (old_size == hashsize) {
-		mutex_unlock(&nf_conntrack_mutex);
 		kvfree(hash);
 		return 0;
 	}
@@ -2502,8 +2561,6 @@ int nf_conntrack_hash_resize(unsigned int hashsize)
 	write_seqcount_end(&nf_conntrack_generation);
 	nf_conntrack_all_unlock();
 	local_bh_enable();
-
-	mutex_unlock(&nf_conntrack_mutex);
 
 	synchronize_net();
 	kvfree(old_hash);

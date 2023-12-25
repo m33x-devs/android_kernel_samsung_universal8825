@@ -40,6 +40,10 @@
 #include <linux/init_task.h>
 #include <linux/uaccess.h>
 
+#ifdef CONFIG_FSCRYPT_SDP
+#include <linux/fscrypto_sdp_name.h>
+#endif
+
 #include "internal.h"
 #include "mount.h"
 
@@ -532,8 +536,6 @@ static void set_nameidata(struct nameidata *p, int dfd, struct filename *name)
 	p->stack = p->internal;
 	p->dfd = dfd;
 	p->name = name;
-	p->path.mnt = NULL;
-	p->path.dentry = NULL;
 	p->total_link_count = old ? old->total_link_count : 0;
 	p->saved = old;
 	current->nameidata = p;
@@ -607,8 +609,6 @@ static void terminate_walk(struct nameidata *nd)
 		rcu_read_unlock();
 	}
 	nd->depth = 0;
-	nd->path.mnt = NULL;
-	nd->path.dentry = NULL;
 }
 
 /* path_put is needed afterwards regardless of success or failure */
@@ -637,11 +637,6 @@ static inline bool legitimize_path(struct nameidata *nd,
 static bool legitimize_links(struct nameidata *nd)
 {
 	int i;
-	if (unlikely(nd->flags & LOOKUP_CACHED)) {
-		drop_links(nd);
-		nd->depth = 0;
-		return false;
-	}
 	for (i = 0; i < nd->depth; i++) {
 		struct saved *last = nd->stack + i;
 		if (unlikely(!legitimize_path(nd, &last->link, last->seq))) {
@@ -717,19 +712,19 @@ out:
 }
 
 /**
- * try_to_unlazy_next - try to switch to ref-walk mode.
+ * unlazy_child - try to switch to ref-walk mode.
  * @nd: nameidata pathwalk data
- * @dentry: next dentry to step into
- * @seq: seq number to check @dentry against
- * Returns: true on success, false on failure
+ * @dentry: child of nd->path.dentry
+ * @seq: seq number to check dentry against
+ * Returns: 0 on success, -ECHILD on failure
  *
- * Similar to to try_to_unlazy(), but here we have the next dentry already
- * picked by rcu-walk and want to legitimize that in addition to the current
- * nd->path and nd->root for ref-walk mode.  Must be called from rcu-walk context.
- * Nothing should touch nameidata between try_to_unlazy_next() failure and
+ * unlazy_child attempts to legitimize the current nd->path, nd->root and dentry
+ * for ref-walk mode.  @dentry must be a path found by a do_lookup call on
+ * @nd.  Must be called from rcu-walk context.
+ * Nothing should touch nameidata between unlazy_child() failure and
  * terminate_walk().
  */
-static bool try_to_unlazy_next(struct nameidata *nd, struct dentry *dentry, unsigned seq)
+static int unlazy_child(struct nameidata *nd, struct dentry *dentry, unsigned seq)
 {
 	BUG_ON(!(nd->flags & LOOKUP_RCU));
 
@@ -759,7 +754,7 @@ static bool try_to_unlazy_next(struct nameidata *nd, struct dentry *dentry, unsi
 	if (unlikely(!legitimize_root(nd)))
 		goto out_dput;
 	rcu_read_unlock();
-	return true;
+	return 0;
 
 out2:
 	nd->path.mnt = NULL;
@@ -767,11 +762,11 @@ out1:
 	nd->path.dentry = NULL;
 out:
 	rcu_read_unlock();
-	return false;
+	return -ECHILD;
 out_dput:
 	rcu_read_unlock();
 	dput(dentry);
-	return false;
+	return -ECHILD;
 }
 
 static inline int d_revalidate(struct dentry *dentry, unsigned int flags)
@@ -879,7 +874,6 @@ static int complete_walk(struct nameidata *nd)
 		 */
 		if (!(nd->flags & (LOOKUP_ROOT | LOOKUP_IS_SCOPED)))
 			nd->root.mnt = NULL;
-		nd->flags &= ~LOOKUP_CACHED;
 		if (!try_to_unlazy(nd))
 			return -ECHILD;
 	}
@@ -1205,13 +1199,21 @@ int follow_up(struct path *path)
 		read_sequnlock_excl(&mount_lock);
 		return 0;
 	}
+#ifdef CONFIG_KDP_NS
+	mntget(((struct kdp_mount *)parent)->mnt);
+#else
 	mntget(&parent->mnt);
+#endif
 	mountpoint = dget(mnt->mnt_mountpoint);
 	read_sequnlock_excl(&mount_lock);
 	dput(path->dentry);
 	path->dentry = mountpoint;
 	mntput(path->mnt);
+#ifdef CONFIG_KDP_NS
+	path->mnt = ((struct kdp_mount *)parent)->mnt;
+#else
 	path->mnt = &parent->mnt;
+#endif
 	return 1;
 }
 EXPORT_SYMBOL(follow_up);
@@ -1224,10 +1226,22 @@ static bool choose_mountpoint_rcu(struct mount *m, const struct path *root,
 
 		m = m->mnt_parent;
 		if (unlikely(root->dentry == mountpoint &&
+#ifdef CONFIG_KDP_NS
+			     root->mnt == ((struct kdp_mount *)m)->mnt))
+#else
 			     root->mnt == &m->mnt))
+#endif
 			break;
+#ifdef CONFIG_KDP_NS
+		if (mountpoint != ((struct kdp_mount *)m)->mnt->mnt_root) {
+#else
 		if (mountpoint != m->mnt.mnt_root) {
+#endif
+#ifdef CONFIG_KDP_NS
+			path->mnt = ((struct kdp_mount *)m)->mnt;
+#else
 			path->mnt = &m->mnt;
+#endif
 			path->dentry = mountpoint;
 			*seqp = read_seqcount_begin(&mountpoint->d_seq);
 			return true;
@@ -1430,8 +1444,13 @@ static bool __follow_mount_rcu(struct nameidata *nd, struct path *path,
 		if (flags & DCACHE_MOUNTED) {
 			struct mount *mounted = __lookup_mnt(path->mnt, dentry);
 			if (mounted) {
+#ifdef CONFIG_KDP_NS
+				path->mnt = ((struct kdp_mount *)mounted)->mnt;
+				dentry = path->dentry = ((struct kdp_mount *)mounted)->mnt->mnt_root;
+#else
 				path->mnt = &mounted->mnt;
 				dentry = path->dentry = mounted->mnt.mnt_root;
+#endif
 				nd->flags |= LOOKUP_JUMPED;
 				*seqp = read_seqcount_begin(&dentry->d_seq);
 				*inode = dentry->d_inode;
@@ -1466,7 +1485,7 @@ static inline int handle_mounts(struct nameidata *nd, struct dentry *dentry,
 			return -ENOENT;
 		if (likely(__follow_mount_rcu(nd, path, inode, seqp)))
 			return 0;
-		if (!try_to_unlazy_next(nd, dentry, seq))
+		if (unlazy_child(nd, dentry, seq))
 			return -ECHILD;
 		// *path might've been clobbered by __follow_mount_rcu()
 		path->mnt = nd->path.mnt;
@@ -1587,7 +1606,7 @@ static struct dentry *lookup_fast(struct nameidata *nd,
 		status = d_revalidate(dentry, nd->flags);
 		if (likely(status > 0))
 			return dentry;
-		if (!try_to_unlazy_next(nd, dentry, seq))
+		if (unlazy_child(nd, dentry, seq))
 			return ERR_PTR(-ECHILD);
 		if (unlikely(status == -ECHILD))
 			/* we'd been told to redo it in non-rcu mode */
@@ -2296,10 +2315,6 @@ static const char *path_init(struct nameidata *nd, unsigned flags)
 	int error;
 	const char *s = nd->name->name;
 
-	/* LOOKUP_CACHED requires RCU, ask caller to retry */
-	if ((flags & (LOOKUP_RCU | LOOKUP_CACHED)) == LOOKUP_CACHED)
-		return ERR_PTR(-EAGAIN);
-
 	if (!*s)
 		flags &= ~LOOKUP_RCU;
 	if (flags & LOOKUP_RCU)
@@ -2329,6 +2344,8 @@ static const char *path_init(struct nameidata *nd, unsigned flags)
 	}
 
 	nd->root.mnt = NULL;
+	nd->path.mnt = NULL;
+	nd->path.dentry = NULL;
 
 	/* Absolute pathname -- fetch the root (LOOKUP_IN_ROOT uses nd->dfd). */
 	if (*s == '/' && !(flags & LOOKUP_IN_ROOT)) {
@@ -2899,7 +2916,7 @@ int vfs_create(struct inode *dir, struct dentry *dentry, umode_t mode,
 		fsnotify_create(dir, dentry);
 	return error;
 }
-EXPORT_SYMBOL_NS(vfs_create, ANDROID_GKI_VFS_EXPORT_ONLY);
+EXPORT_SYMBOL(vfs_create);
 
 int vfs_mkobj(struct dentry *dentry, umode_t mode,
 		int (*f)(struct dentry *, umode_t, void *),
@@ -3739,7 +3756,7 @@ int vfs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
 		fsnotify_mkdir(dir, dentry);
 	return error;
 }
-EXPORT_SYMBOL_NS(vfs_mkdir, ANDROID_GKI_VFS_EXPORT_ONLY);
+EXPORT_SYMBOL(vfs_mkdir);
 
 static long do_mkdirat(int dfd, const char __user *pathname, umode_t mode)
 {
@@ -3797,6 +3814,12 @@ int vfs_rmdir(struct inode *dir, struct dentry *dentry)
 	if (error)
 		goto out;
 
+#ifdef CONFIG_FSCRYPT_SDP
+	error = fscrypt_sdp_check_rmdir(dentry);
+	if (error == -EIO)
+		goto out;
+#endif
+
 	error = dir->i_op->rmdir(dir, dentry);
 	if (error)
 		goto out;
@@ -3805,15 +3828,16 @@ int vfs_rmdir(struct inode *dir, struct dentry *dentry)
 	dentry->d_inode->i_flags |= S_DEAD;
 	dont_mount(dentry);
 	detach_mounts(dentry);
+	fsnotify_rmdir(dir, dentry);
 
 out:
 	inode_unlock(dentry->d_inode);
 	dput(dentry);
 	if (!error)
-		d_delete_notify(dir, dentry);
+		d_delete(dentry);
 	return error;
 }
-EXPORT_SYMBOL_NS(vfs_rmdir, ANDROID_GKI_VFS_EXPORT_ONLY);
+EXPORT_SYMBOL(vfs_rmdir);
 
 long do_rmdir(int dfd, struct filename *name)
 {
@@ -3858,6 +3882,10 @@ retry:
 	if (error)
 		goto exit3;
 	error = vfs_rmdir(path.dentry->d_inode, dentry);
+#ifdef CONFIG_PROC_DLOG
+	if (!error)
+		dlog_hook_rmdir(dentry, &path);
+#endif
 exit3:
 	dput(dentry);
 exit2:
@@ -3920,6 +3948,7 @@ int vfs_unlink(struct inode *dir, struct dentry *dentry, struct inode **delegate
 			if (!error) {
 				dont_mount(dentry);
 				detach_mounts(dentry);
+				fsnotify_unlink(dir, dentry);
 			}
 		}
 	}
@@ -3927,16 +3956,14 @@ out:
 	inode_unlock(target);
 
 	/* We don't d_delete() NFS sillyrenamed files--they still exist. */
-	if (!error && dentry->d_flags & DCACHE_NFSFS_RENAMED) {
-		fsnotify_unlink(dir, dentry);
-	} else if (!error) {
+	if (!error && !(dentry->d_flags & DCACHE_NFSFS_RENAMED)) {
 		fsnotify_link_count(target);
-		d_delete_notify(dir, dentry);
+		d_delete(dentry);
 	}
 
 	return error;
 }
-EXPORT_SYMBOL_NS(vfs_unlink, ANDROID_GKI_VFS_EXPORT_ONLY);
+EXPORT_SYMBOL(vfs_unlink);
 
 /*
  * Make sure that the actual truncation of the file will occur outside its
@@ -3982,6 +4009,10 @@ retry_deleg:
 		if (error)
 			goto exit2;
 		error = vfs_unlink(path.dentry->d_inode, dentry, &delegated_inode);
+#ifdef CONFIG_PROC_DLOG
+		if (!error)
+			dlog_hook(dentry, inode, &path);
+#endif
 exit2:
 		dput(dentry);
 	}
@@ -4171,7 +4202,7 @@ int vfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *new_de
 		fsnotify_link(dir, inode, new_dentry);
 	return error;
 }
-EXPORT_SYMBOL_NS(vfs_link, ANDROID_GKI_VFS_EXPORT_ONLY);
+EXPORT_SYMBOL(vfs_link);
 
 /*
  * Hardlinks are often used in delicate situations.  We avoid
@@ -4394,10 +4425,19 @@ int vfs_rename(struct inode *old_dir, struct dentry *old_dentry,
 		if (error)
 			goto out;
 	}
+#ifdef CONFIG_FSCRYPT_SDP
+	error = fscrypt_sdp_check_rename_pre(old_dentry);
+	if (error == -EIO)
+		goto out;
+#endif
 	error = old_dir->i_op->rename(old_dir, old_dentry,
 				       new_dir, new_dentry, flags);
 	if (error)
 		goto out;
+#ifdef CONFIG_FSCRYPT_SDP
+	fscrypt_sdp_check_rename_post(old_dir, old_dentry,
+						new_dir, new_dentry);
+#endif
 
 	if (!(flags & RENAME_EXCHANGE) && target) {
 		if (is_dir) {
@@ -4431,10 +4471,10 @@ out:
 
 	return error;
 }
-EXPORT_SYMBOL_NS(vfs_rename, ANDROID_GKI_VFS_EXPORT_ONLY);
+EXPORT_SYMBOL(vfs_rename);
 
-int do_renameat2(int olddfd, struct filename *from, int newdfd,
-		 struct filename *to, unsigned int flags)
+static int do_renameat2(int olddfd, const char __user *oldname, int newdfd,
+			const char __user *newname, unsigned int flags)
 {
 	struct dentry *old_dentry, *new_dentry;
 	struct dentry *trap;
@@ -4442,30 +4482,32 @@ int do_renameat2(int olddfd, struct filename *from, int newdfd,
 	struct qstr old_last, new_last;
 	int old_type, new_type;
 	struct inode *delegated_inode = NULL;
+	struct filename *from;
+	struct filename *to;
 	unsigned int lookup_flags = 0, target_flags = LOOKUP_RENAME_TARGET;
 	bool should_retry = false;
-	int error = -EINVAL;
+	int error;
 
 	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT))
-		goto put_both;
+		return -EINVAL;
 
 	if ((flags & (RENAME_NOREPLACE | RENAME_WHITEOUT)) &&
 	    (flags & RENAME_EXCHANGE))
-		goto put_both;
+		return -EINVAL;
 
 	if (flags & RENAME_EXCHANGE)
 		target_flags = 0;
 
 retry:
-	from = filename_parentat(olddfd, from, lookup_flags, &old_path,
-					&old_last, &old_type);
+	from = filename_parentat(olddfd, getname(oldname), lookup_flags,
+				&old_path, &old_last, &old_type);
 	if (IS_ERR(from)) {
 		error = PTR_ERR(from);
-		goto put_new;
+		goto exit;
 	}
 
-	to = filename_parentat(newdfd, to, lookup_flags, &new_path, &new_last,
-				&new_type);
+	to = filename_parentat(newdfd, getname(newname), lookup_flags,
+				&new_path, &new_last, &new_type);
 	if (IS_ERR(to)) {
 		error = PTR_ERR(to);
 		goto exit1;
@@ -4558,40 +4600,34 @@ exit2:
 	if (retry_estale(error, lookup_flags))
 		should_retry = true;
 	path_put(&new_path);
+	putname(to);
 exit1:
 	path_put(&old_path);
+	putname(from);
 	if (should_retry) {
 		should_retry = false;
 		lookup_flags |= LOOKUP_REVAL;
 		goto retry;
 	}
-put_both:
-	if (!IS_ERR(from))
-		putname(from);
-put_new:
-	if (!IS_ERR(to))
-		putname(to);
+exit:
 	return error;
 }
 
 SYSCALL_DEFINE5(renameat2, int, olddfd, const char __user *, oldname,
 		int, newdfd, const char __user *, newname, unsigned int, flags)
 {
-	return do_renameat2(olddfd, getname(oldname), newdfd, getname(newname),
-				flags);
+	return do_renameat2(olddfd, oldname, newdfd, newname, flags);
 }
 
 SYSCALL_DEFINE4(renameat, int, olddfd, const char __user *, oldname,
 		int, newdfd, const char __user *, newname)
 {
-	return do_renameat2(olddfd, getname(oldname), newdfd, getname(newname),
-				0);
+	return do_renameat2(olddfd, oldname, newdfd, newname, 0);
 }
 
 SYSCALL_DEFINE2(rename, const char __user *, oldname, const char __user *, newname)
 {
-	return do_renameat2(AT_FDCWD, getname(oldname), AT_FDCWD,
-				getname(newname), 0);
+	return do_renameat2(AT_FDCWD, oldname, AT_FDCWD, newname, 0);
 }
 
 int readlink_copy(char __user *buffer, int buflen, const char *link)

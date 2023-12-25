@@ -361,7 +361,8 @@ static void enable_tx_dma(struct s3c24xx_uart_port *ourport)
 	/* Enable tx dma mode */
 	ucon = rd_regl(port, S3C2410_UCON);
 	ucon &= ~(S3C64XX_UCON_TXBURST_MASK | S3C64XX_UCON_TXMODE_MASK);
-	ucon |= S3C64XX_UCON_TXBURST_1;
+	ucon |= (dma_get_cache_alignment() >= 16) ?
+		S3C64XX_UCON_TXBURST_16 : S3C64XX_UCON_TXBURST_1;
 	ucon |= S3C64XX_UCON_TXMODE_DMA;
 	wr_regl(port,  S3C2410_UCON, ucon);
 
@@ -633,7 +634,7 @@ static void enable_rx_dma(struct s3c24xx_uart_port *ourport)
 			S3C64XX_UCON_DMASUS_EN |
 			S3C64XX_UCON_TIMEOUT_EN |
 			S3C64XX_UCON_RXMODE_MASK);
-	ucon |= S3C64XX_UCON_RXBURST_1 |
+	ucon |= S3C64XX_UCON_RXBURST_16 |
 			0xf << S3C64XX_UCON_TIMEOUT_SHIFT |
 			S3C64XX_UCON_EMPTYINT_EN |
 			S3C64XX_UCON_TIMEOUT_EN |
@@ -882,8 +883,11 @@ static irqreturn_t s3c24xx_serial_tx_chars(int irq, void *id)
 		goto out;
 	}
 
-	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
+	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS) {
+		spin_unlock(&port->lock);
 		uart_write_wakeup(port);
+		spin_lock(&port->lock);
+	}
 
 	if (uart_circ_empty(xmit))
 		s3c24xx_serial_stop_tx(port);
@@ -1398,6 +1402,12 @@ static void s3c24xx_serial_set_termios(struct uart_port *port,
 	 */
 
 	baud = uart_get_baud_rate(port, termios, old, 0, 3000000);
+
+	if (!baud) {
+		dev_err(port->dev, "Invalid baudrate:[%d]\n", baud);
+		return;
+	}
+
 	quot = s3c24xx_serial_getclk(ourport, baud, &clk, &clk_sel);
 	if (baud == 38400 && (port->flags & UPF_SPD_MASK) == UPF_SPD_CUST)
 		quot = port->custom_divisor;
@@ -1422,6 +1432,11 @@ static void s3c24xx_serial_set_termios(struct uart_port *port,
 
 	if (ourport->info->has_divslot) {
 		unsigned int div = ourport->baudclk_rate / baud;
+
+		if (!div) {
+			dev_err(port->dev, "Invalid div:[%d]\n", div);
+			return;
+		}
 
 		if (cfg->has_fracval) {
 			udivslot = (div & 15);
@@ -1692,6 +1707,23 @@ s3c24xx_serial_ports[CONFIG_SERIAL_SAMSUNG_UARTS] = {
 };
 #undef __PORT_LOCK_UNLOCKED
 
+static void exynos_usi_init(struct uart_port *port)
+{
+	/* USI_RESET is active High signal.
+	 * Reset value of USI_RESET is 'h1 to drive stable value to PAD.
+	 * Due to this feature, the USI_RESET must be cleared (set as '0')
+	 * before transaction starts.
+	 */
+
+	wr_regl(port, USI_CON, USI_RESET);
+	udelay(1);
+
+	/* set the HWACG option bit in case of UART Rx mode.
+	 * CLKREQ_ON = 1, CLKSTOP_ON = 0 (set USI_OPTION[2:1] = 2'h1)
+	 */
+	wr_regl(port, USI_OPTION, USI_HWACG_CLKREQ_ON);
+}
+
 /* s3c24xx_serial_resetport
  *
  * reset the fifos and other the settings.
@@ -1921,6 +1953,7 @@ static int s3c24xx_serial_init_port(struct s3c24xx_uart_port *ourport,
 		}
 	}
 
+#if 0
 	ourport->clk	= clk_get(&platdev->dev, "uart");
 	if (IS_ERR(ourport->clk)) {
 		pr_err("%s: Controller clock not found\n",
@@ -1935,10 +1968,13 @@ static int s3c24xx_serial_init_port(struct s3c24xx_uart_port *ourport,
 		clk_put(ourport->clk);
 		goto err;
 	}
+#endif
 
 	ret = s3c24xx_serial_enable_baudclk(ourport);
 	if (ret)
 		pr_warn("uart: failed to enable baudclk\n");
+
+	exynos_usi_init(port);
 
 	/* Keep all interrupts masked and cleared */
 	if (s3c24xx_serial_has_interrupt_mask(port)) {

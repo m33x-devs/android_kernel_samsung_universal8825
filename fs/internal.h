@@ -59,6 +59,14 @@ extern int __block_write_begin_int(struct page *page, loff_t pos, unsigned len,
  */
 extern void __init chrdev_init(void);
 
+#ifdef CONFIG_PROC_DLOG
+/*
+ * dlog_hook.c
+ */
+void dlog_hook(struct dentry *, struct inode *, struct path *);
+void dlog_hook_rmdir(struct dentry *, struct path *);
+#endif
+
 /*
  * fs_context.c
  */
@@ -77,8 +85,6 @@ extern int vfs_path_lookup(struct dentry *, struct vfsmount *,
 long do_rmdir(int dfd, struct filename *name);
 long do_unlinkat(int dfd, struct filename *name);
 int may_linkat(struct path *link);
-int do_renameat2(int olddfd, struct filename *oldname, int newdfd,
-		 struct filename *newname, unsigned int flags);
 
 /*
  * namespace.c
@@ -134,7 +140,6 @@ extern struct file *do_file_open_root(struct dentry *, struct vfsmount *,
 		const char *, const struct open_flags *);
 extern struct open_how build_open_how(int flags, umode_t mode);
 extern int build_open_flags(const struct open_how *how, struct open_flags *op);
-extern int __close_fd_get_file(unsigned int fd, struct file **res);
 
 long do_sys_ftruncate(unsigned int fd, loff_t length, int small);
 int chmod_common(const struct path *path, umode_t mode);

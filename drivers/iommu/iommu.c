@@ -186,14 +186,9 @@ static struct dev_iommu *dev_iommu_get(struct device *dev)
 
 static void dev_iommu_free(struct device *dev)
 {
-	struct dev_iommu *param = dev->iommu;
-
+	iommu_fwspec_free(dev);
+	kfree(dev->iommu);
 	dev->iommu = NULL;
-	if (param->fwspec) {
-		fwnode_handle_put(param->fwspec->iommu_fwnode);
-		kfree(param->fwspec);
-	}
-	kfree(param);
 }
 
 static int __iommu_probe_device(struct device *dev, struct list_head *group_list)

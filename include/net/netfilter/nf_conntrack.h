@@ -26,6 +26,14 @@
 
 #include <net/netfilter/nf_conntrack_tuple.h>
 
+
+// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+#define PROCESS_NAME_LEN_NAP	128
+#define DOMAIN_NAME_LEN_NAP		255
+#endif
+// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
+
 struct nf_ct_udp {
 	unsigned long	stream_ts;
 };
@@ -56,6 +64,29 @@ struct nf_conntrack_net {
 
 #include <net/netfilter/ipv4/nf_conntrack_ipv4.h>
 #include <net/netfilter/ipv6/nf_conntrack_ipv6.h>
+
+// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+#ifdef CONFIG_KNOX_NCM
+struct nf_conn_npa_vendor_data {
+	__u64		knox_sent;
+	__u64		knox_recv;
+	uid_t		knox_uid;
+	pid_t		knox_pid;
+	uid_t		knox_puid;
+	__u64		open_time;
+	char		process_name[PROCESS_NAME_LEN_NAP];
+	char		parent_process_name[PROCESS_NAME_LEN_NAP];
+	char		domain_name[DOMAIN_NAME_LEN_NAP];
+	pid_t		knox_ppid;
+	char		interface_name[IFNAMSIZ];
+	atomic_t	startFlow;
+	u32			npa_timeout;
+	atomic_t	intermediateFlow;
+};
+
+#define NF_CONN_NPA_VENDOR_DATA_GET(nf_conn) ((struct nf_conn_npa_vendor_data*)((nf_conn)->android_oem_data1))
+#endif
+// SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
 
 struct nf_conn {
 	/* Usage count in here is 1 for hash table, 1 per skb,
@@ -269,14 +300,14 @@ static inline bool nf_is_loopback_packet(const struct sk_buff *skb)
 /* jiffies until ct expires, 0 if already expired */
 static inline unsigned long nf_ct_expires(const struct nf_conn *ct)
 {
-	s32 timeout = READ_ONCE(ct->timeout) - nfct_time_stamp;
+	s32 timeout = ct->timeout - nfct_time_stamp;
 
 	return timeout > 0 ? timeout : 0;
 }
 
 static inline bool nf_ct_is_expired(const struct nf_conn *ct)
 {
-	return (__s32)(READ_ONCE(ct->timeout) - nfct_time_stamp) <= 0;
+	return (__s32)(ct->timeout - nfct_time_stamp) <= 0;
 }
 
 /* use after obtaining a reference count */
@@ -295,7 +326,7 @@ static inline bool nf_ct_should_gc(const struct nf_conn *ct)
 static inline void nf_ct_offload_timeout(struct nf_conn *ct)
 {
 	if (nf_ct_expires(ct) < NF_CT_DAY / 2)
-		WRITE_ONCE(ct->timeout, nfct_time_stamp + NF_CT_DAY);
+		ct->timeout = nfct_time_stamp + NF_CT_DAY;
 }
 
 struct kernel_param;

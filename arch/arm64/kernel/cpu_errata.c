@@ -210,8 +210,6 @@ static const struct arm64_cpu_capabilities arm64_repeat_tlbi_list[] = {
 #ifdef CONFIG_ARM64_ERRATUM_1286807
 	{
 		ERRATA_MIDR_RANGE(MIDR_CORTEX_A76, 0, 0, 3, 0),
-		/* Kryo4xx Gold (rcpe to rfpe) => (r0p0 to r3p0) */
-		ERRATA_MIDR_RANGE(MIDR_QCOM_KRYO_4XX_GOLD, 0xc, 0xe, 0xf, 0xe),
 	},
 #endif
 	{},
@@ -344,17 +342,15 @@ static const struct midr_range erratum_1463225[] = {
 };
 #endif
 
-#ifdef CONFIG_ARM64_WORKAROUND_TSB_FLUSH_FAILURE
-static const struct midr_range tsb_flush_fail_cpus[] = {
-#ifdef CONFIG_ARM64_ERRATUM_2067961
-	MIDR_ALL_VERSIONS(MIDR_NEOVERSE_N2),
-#endif
-#ifdef CONFIG_ARM64_ERRATUM_2054223
-	MIDR_ALL_VERSIONS(MIDR_CORTEX_A710),
-#endif
+#ifdef CONFIG_ARM64_WORKAROUND_DSB_AFTER_TLBI
+static const struct arm64_cpu_capabilities arm64_dsb_after_tlbi_list[] = {
+	{
+	/* Klein r0p0 - r0p1 */
+		ERRATA_MIDR_RANGE(MIDR_CORTEX_A510, 0, 0, 0, 1),
+	},
 	{},
 };
-#endif	/* CONFIG_ARM64_WORKAROUND_TSB_FLUSH_FAILURE */
+#endif
 
 const struct arm64_cpu_capabilities arm64_errata[] = {
 #ifdef CONFIG_ARM64_WORKAROUND_CLEAN_CACHE
@@ -549,11 +545,13 @@ const struct arm64_cpu_capabilities arm64_errata[] = {
 				  1, 0),
 	},
 #endif
-#ifdef CONFIG_ARM64_WORKAROUND_TSB_FLUSH_FAILURE
+#ifdef CONFIG_ARM64_WORKAROUND_DSB_AFTER_TLBI
 	{
-		.desc = "ARM erratum 2067961 or 2054223",
-		.capability = ARM64_WORKAROUND_TSB_FLUSH_FAILURE,
-		ERRATA_MIDR_RANGE_LIST(tsb_flush_fail_cpus),
+		.desc = "Klein erratum (PJ02607-8576)",
+		.capability = ARM64_WORKAROUND_DSB_AFTER_TLBI,
+		.type = ARM64_CPUCAP_LOCAL_CPU_ERRATUM,
+		.matches = cpucap_multi_entry_cap_matches,
+		.match_list = arm64_dsb_after_tlbi_list,
 	},
 #endif
 	{

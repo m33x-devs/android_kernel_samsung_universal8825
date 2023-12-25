@@ -1503,8 +1503,7 @@ xfs_reflink_unshare(
 	if (error)
 		goto out;
 
-	error = filemap_write_and_wait_range(inode->i_mapping, offset,
-			offset + len - 1);
+	error = filemap_write_and_wait_range(inode->i_mapping, offset, len);
 	if (error)
 		goto out;
 

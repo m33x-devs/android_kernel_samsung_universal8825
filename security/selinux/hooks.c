@@ -214,7 +214,14 @@ static void cred_init_security(void)
 	struct cred *cred = (struct cred *) current->real_cred;
 	struct task_security_struct *tsec;
 
+#ifdef CONFIG_KDP_CRED
+	tsec = &init_sec;
+	tsec->bp_cred = cred;
+	// is not support 5.4 upper version, so we added
+	cred->security = tsec;
+#else
 	tsec = selinux_cred(cred);
+#endif
 	tsec->osid = tsec->sid = SECINITSID_KERNEL;
 }
 
@@ -703,6 +710,9 @@ static int selinux_set_mnt_opts(struct super_block *sb,
 
 	if (!strcmp(sb->s_type->name, "debugfs") ||
 	    !strcmp(sb->s_type->name, "tracefs") ||
+// [ SEC_SELINUX_PORTING_COMMON
+		!strcmp(sb->s_type->name, "configfs") ||
+// ] SEC_SELINUX_PORTING_COMMON			
 	    !strcmp(sb->s_type->name, "binder") ||
 	    !strcmp(sb->s_type->name, "bpf") ||
 	    !strcmp(sb->s_type->name, "pstore"))
@@ -948,22 +958,18 @@ out:
 static int selinux_add_opt(int token, const char *s, void **mnt_opts)
 {
 	struct selinux_mnt_opts *opts = *mnt_opts;
-	bool is_alloc_opts = false;
 
 	if (token == Opt_seclabel)	/* eaten and completely ignored */
 		return 0;
-
-	if (!s)
-		return -ENOMEM;
 
 	if (!opts) {
 		opts = kzalloc(sizeof(struct selinux_mnt_opts), GFP_KERNEL);
 		if (!opts)
 			return -ENOMEM;
 		*mnt_opts = opts;
-		is_alloc_opts = true;
 	}
-
+	if (!s)
+		return -ENOMEM;
 	switch (token) {
 	case Opt_context:
 		if (opts->context || opts->defcontext)
@@ -988,10 +994,6 @@ static int selinux_add_opt(int token, const char *s, void **mnt_opts)
 	}
 	return 0;
 Einval:
-	if (is_alloc_opts) {
-		kfree(opts);
-		*mnt_opts = NULL;
-	}
 	pr_warn(SEL_MOUNT_FAIL_MSG);
 	return -EINVAL;
 }
@@ -2823,9 +2825,10 @@ static int selinux_fs_context_parse_param(struct fs_context *fc,
 		return opt;
 
 	rc = selinux_add_opt(opt, param->string, &fc->security);
-	if (!rc)
+	if (!rc) {
 		param->string = NULL;
-
+		rc = 1;
+	}
 	return rc;
 }
 
@@ -3704,12 +3707,6 @@ static int selinux_file_ioctl(struct file *file, unsigned int cmd,
 	case KDSKBSENT:
 		error = cred_has_capability(cred, CAP_SYS_TTY_CONFIG,
 					    CAP_OPT_NONE, true);
-		break;
-
-	case FIOCLEX:
-	case FIONCLEX:
-		if (!selinux_policycap_ioctl_skip_cloexec())
-			error = ioctl_has_perm(cred, file, FILE__IOCTL, (u16) cmd);
 		break;
 
 	/* default case assumes that the command will go
@@ -5507,9 +5504,9 @@ static void selinux_secmark_refcount_dec(void)
 }
 
 static void selinux_req_classify_flow(const struct request_sock *req,
-				      struct flowi_common *flic)
+				      struct flowi *fl)
 {
-	flic->flowic_secid = req->secid;
+	fl->flowi_secid = req->secid;
 }
 
 static int selinux_tun_dev_alloc_security(void **security)
@@ -5737,7 +5734,7 @@ static unsigned int selinux_ip_postroute_compat(struct sk_buff *skb,
 	struct common_audit_data ad;
 	struct lsm_network_audit net = {0,};
 	char *addrp;
-	u8 proto = 0;
+	u8 proto;
 
 	if (sk == NULL)
 		return NF_ACCEPT;
@@ -7002,7 +6999,11 @@ static int selinux_perf_event_write(struct perf_event *event)
  * safely. Breaking the ordering rules above might lead to NULL pointer derefs
  * when disabling SELinux at runtime.
  */
+#ifdef CONFIG_KDP_CRED
+static struct security_hook_list selinux_hooks[] __lsm_ro_after_init_kdp = {
+#else
 static struct security_hook_list selinux_hooks[] __lsm_ro_after_init = {
+#endif
 	LSM_HOOK_INIT(binder_set_context_mgr, selinux_binder_set_context_mgr),
 	LSM_HOOK_INIT(binder_transaction, selinux_binder_transaction),
 	LSM_HOOK_INIT(binder_transfer_binder, selinux_binder_transfer_binder),

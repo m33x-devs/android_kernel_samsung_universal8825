@@ -268,14 +268,7 @@ struct gpio_irq_chip {
 	 */
 	void		(*irq_mask)(struct irq_data *data);
 
-	/**
-	 * @initialized:
-	 *
-	 * Flag to track GPIO chip irq member's initialization.
-	 * This flag will make sure GPIO chip irq members are not used
-	 * before they are initialized.
-	 */
-	ANDROID_KABI_USE(1, bool initialized);
+	ANDROID_KABI_RESERVE(1);
 	ANDROID_KABI_RESERVE(2);
 };
 

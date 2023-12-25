@@ -34,12 +34,14 @@
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/android_fs.h>
-
 EXPORT_TRACEPOINT_SYMBOL(android_fs_datawrite_start);
 EXPORT_TRACEPOINT_SYMBOL(android_fs_datawrite_end);
 EXPORT_TRACEPOINT_SYMBOL(android_fs_dataread_start);
 EXPORT_TRACEPOINT_SYMBOL(android_fs_dataread_end);
-
+#ifdef CONFIG_F2FS_ML_BASED_STREAM_SEPARATION
+EXPORT_TRACEPOINT_SYMBOL(android_fs_datawrite_start_wb);
+EXPORT_TRACEPOINT_SYMBOL(android_fs_separation_start);
+#endif
 /*
  * I/O completion handler for multipage BIOs.
  *
@@ -430,7 +432,7 @@ void mpage_readahead(struct readahead_control *rac, get_block_t get_block)
 	if (args.bio)
 		mpage_bio_submit(REQ_OP_READ, REQ_RAHEAD, args.bio);
 }
-EXPORT_SYMBOL_NS(mpage_readahead, ANDROID_GKI_VFS_EXPORT_ONLY);
+EXPORT_SYMBOL(mpage_readahead);
 
 /*
  * This isn't called much at all
@@ -448,7 +450,7 @@ int mpage_readpage(struct page *page, get_block_t get_block)
 		mpage_bio_submit(REQ_OP_READ, 0, args.bio);
 	return 0;
 }
-EXPORT_SYMBOL_NS(mpage_readpage, ANDROID_GKI_VFS_EXPORT_ONLY);
+EXPORT_SYMBOL(mpage_readpage);
 
 /*
  * Writing is not so simple.

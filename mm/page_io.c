@@ -25,7 +25,6 @@
 #include <linux/psi.h>
 #include <linux/uio.h>
 #include <linux/sched/task.h>
-#include <trace/hooks/mm.h>
 
 static struct bio *get_swap_bio(gfp_t gfp_flags,
 				struct page *page, bio_end_io_t end_io)
@@ -61,13 +60,63 @@ void end_swap_bio_write(struct bio *bio)
 		 * Also clear PG_reclaim to avoid rotate_reclaimable_page()
 		 */
 		set_page_dirty(page);
+#if !IS_ENABLED(CONFIG_ZRAM)
 		pr_alert_ratelimited("Write-error on swap-device (%u:%u:%llu)\n",
 				     MAJOR(bio_dev(bio)), MINOR(bio_dev(bio)),
 				     (unsigned long long)bio->bi_iter.bi_sector);
+#endif
 		ClearPageReclaim(page);
 	}
 	end_page_writeback(page);
 	bio_put(bio);
+}
+
+static void swap_slot_free_notify(struct page *page)
+{
+	struct swap_info_struct *sis;
+	struct gendisk *disk;
+	swp_entry_t entry;
+
+	/*
+	 * There is no guarantee that the page is in swap cache - the software
+	 * suspend code (at least) uses end_swap_bio_read() against a non-
+	 * swapcache page.  So we must check PG_swapcache before proceeding with
+	 * this optimization.
+	 */
+	if (unlikely(!PageSwapCache(page)))
+		return;
+
+	sis = page_swap_info(page);
+	if (data_race(!(sis->flags & SWP_BLKDEV)))
+		return;
+
+	/*
+	 * The swap subsystem performs lazy swap slot freeing,
+	 * expecting that the page will be swapped out again.
+	 * So we can avoid an unnecessary write if the page
+	 * isn't redirtied.
+	 * This is good for real swap storage because we can
+	 * reduce unnecessary I/O and enhance wear-leveling
+	 * if an SSD is used as the as swap device.
+	 * But if in-memory swap device (eg zram) is used,
+	 * this causes a duplicated copy between uncompressed
+	 * data in VM-owned memory and compressed data in
+	 * zram-owned memory.  So let's free zram-owned memory
+	 * and make the VM-owned decompressed page *dirty*,
+	 * so the page should be swapped out somewhere again if
+	 * we again wish to reclaim it.
+	 */
+	disk = sis->bdev->bd_disk;
+	entry.val = page_private(page);
+	if (disk->fops->swap_slot_free_notify && __swap_count(entry) == 1) {
+		unsigned long offset;
+
+		offset = swp_offset(entry);
+
+		SetPageDirty(page);
+		disk->fops->swap_slot_free_notify(sis->bdev,
+				offset);
+	}
 }
 
 static void end_swap_bio_read(struct bio *bio)
@@ -85,6 +134,7 @@ static void end_swap_bio_read(struct bio *bio)
 	}
 
 	SetPageUptodate(page);
+	swap_slot_free_notify(page);
 out:
 	unlock_page(page);
 	WRITE_ONCE(bio->bi_private, NULL);
@@ -257,7 +307,6 @@ int __swap_writepage(struct page *page, struct writeback_control *wbc,
 	struct bio *bio;
 	int ret;
 	struct swap_info_struct *sis = page_swap_info(page);
-	bool skip = false;
 
 	VM_BUG_ON_PAGE(!PageSwapCache(page), page);
 	if (data_race(sis->flags & SWP_FS_OPS)) {
@@ -279,7 +328,6 @@ int __swap_writepage(struct page *page, struct writeback_control *wbc,
 		unlock_page(page);
 		ret = mapping->a_ops->direct_IO(&kiocb, &from);
 		if (ret == PAGE_SIZE) {
-			trace_android_vh_count_pswpout(sis);
 			count_vm_event(PSWPOUT);
 			ret = 0;
 		} else {
@@ -304,9 +352,7 @@ int __swap_writepage(struct page *page, struct writeback_control *wbc,
 
 	ret = bdev_write_page(sis->bdev, swap_page_sector(page), page, wbc);
 	if (!ret) {
-		trace_android_vh_count_swpout_vm_event(sis, page, &skip);
-		if (!skip)
-			count_swpout_vm_event(page);
+		count_swpout_vm_event(page);
 		return 0;
 	}
 
@@ -318,9 +364,7 @@ int __swap_writepage(struct page *page, struct writeback_control *wbc,
 	}
 	bio->bi_opf = REQ_OP_WRITE | REQ_SWAP | wbc_to_write_flags(wbc);
 	bio_associate_blkg_from_page(bio, page);
-	trace_android_vh_count_swpout_vm_event(sis, page, &skip);
-	if (!skip)
-		count_swpout_vm_event(page);
+	count_swpout_vm_event(page);
 	set_page_writeback(page);
 	unlock_page(page);
 	submit_bio(bio);
@@ -359,17 +403,19 @@ int swap_readpage(struct page *page, bool synchronous)
 		struct address_space *mapping = swap_file->f_mapping;
 
 		ret = mapping->a_ops->readpage(swap_file, page);
-		if (!ret) {
-			trace_android_vh_count_pswpin(sis);
+		if (!ret)
 			count_vm_event(PSWPIN);
-		}
 		goto out;
 	}
 
 	if (sis->flags & SWP_SYNCHRONOUS_IO) {
 		ret = bdev_read_page(sis->bdev, swap_page_sector(page), page);
 		if (!ret) {
-			trace_android_vh_count_pswpin(sis);
+			if (trylock_page(page)) {
+				swap_slot_free_notify(page);
+				unlock_page(page);
+			}
+
 			count_vm_event(PSWPIN);
 			goto out;
 		}
@@ -393,7 +439,6 @@ int swap_readpage(struct page *page, bool synchronous)
 		get_task_struct(current);
 		bio->bi_private = current;
 	}
-	trace_android_vh_count_pswpin(sis);
 	count_vm_event(PSWPIN);
 	bio_get(bio);
 	qc = submit_bio(bio);
